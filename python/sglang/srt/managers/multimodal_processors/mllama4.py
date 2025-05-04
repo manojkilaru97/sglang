@@ -62,6 +62,28 @@ class Mllama4ImageProcessor(BaseMultimodalProcessor):
             images=processed_data.images,
         )
 
+        # Ensure pixel_values exists; if not, compute them using the image_processor.
+        # If `processed_data.images` is None (e.g. the image placeholder was
+        # missing from the prompt after decoding), fall back to the original
+        # `image_data` argument.
+
+        if (
+            "pixel_values" not in processor_output
+            or processor_output["pixel_values"] is None
+        ):
+            images_to_process = (
+                processed_data.images if processed_data.images else image_data
+            )
+            try:
+                processor_output["pixel_values"] = processor.image_processor(
+                    images_to_process, return_tensors="pt"
+                ).pixel_values
+            except Exception as e:
+                raise KeyError(
+                    "pixel_values missing from processor output and unable to generate: "
+                    + str(e)
+                )
+
         # Handle image resolutions and aspect ratios
         if "pixel_values" in processor_output:
             image_processor = processor.image_processor
@@ -76,6 +98,14 @@ class Mllama4ImageProcessor(BaseMultimodalProcessor):
                 patch_size=SizeDict(height=tile_size, width=tile_size),
             )
 
+            # Choose the image list to work with (processed images may be None if
+            # the placeholder was absent).  Fall back to the list we just
+            # processed for `pixel_values`.
+
+            images_for_calc = (
+                processed_data.images if processed_data.images else images_to_process
+            )
+
             # Find best fit for each image
             best_fit_sizes = [
                 get_best_fit(
@@ -83,7 +113,7 @@ class Mllama4ImageProcessor(BaseMultimodalProcessor):
                     torch.tensor(possible_resolutions),
                     resize_to_max_canvas=image_processor.resize_to_max_canvas,
                 )
-                for image in processed_data.images
+                for image in images_for_calc
             ]
 
             # Calculate aspect ratios and patches per image
