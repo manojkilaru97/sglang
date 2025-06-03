@@ -17,21 +17,25 @@ from sglang.srt.openai_api.protocol import Tool
 logger = logging.getLogger(__name__)
 
 
-class DeepSeekV3Detector(BaseFormatDetector):
+class DeepSeekV3DetectorCustom(BaseFormatDetector):
     """
-    Detector for DeepSeek models.
+    Custom Detector for DeepSeek models.
     Assumes function call format:
-      '<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_current_weather\n```json\n{"location": "Tokyo"}\n```<｜tool▁call▁end｜>\n<｜tool▁call▁begin｜>function<｜tool▁sep｜>get_current_weather\n```json\n{"location": "Paris"}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜><｜end▁of▁sentence｜>
+      '<｜tool▁call▁begin｜>function's current weather\n```json\n{"location": "Tokyo"}\n```<｜tool▁call▁end｜>\n<｜tool▁call▁begin｜>function's current weather\n```json\n{"location": "Paris"}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>
     """
 
     def __init__(self):
         super().__init__()
-        self.bot_token = "<｜tool▁calls▁begin｜>"
+        self.bot_token = "<｜tool▁call▁begin｜>"
         self.eot_token = "<｜tool▁calls▁end｜>"
         self.func_call_regex = r"<｜tool▁call▁begin｜>.*?<｜tool▁call▁end｜>"
-        self.func_detail_regex = r"<｜tool▁call▁begin｜>(.*)<｜tool▁sep｜>(.*)\n```json\n(.*)\n```<｜tool▁call▁end｜>"
+        self.func_detail_regex = r"<｜tool▁call▁begin｜>(.*) (.*)\n```json\n(.*)\n```<｜tool▁call▁end｜>"
         self._last_arguments = ""
         self.current_tool_id = -1
+        self.current_tool_name_sent = False
+        self._buffer = ""
+        self.prev_tool_call_arr = []
+        self.streamed_args_for_tool = []
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a deepseek format tool call."""
@@ -98,7 +102,7 @@ class DeepSeekV3Detector(BaseFormatDetector):
         calls: list[ToolCallItem] = []
         try:
             partial_match = re.search(
-                pattern=r"<｜tool▁call▁begin｜>(.*)<｜tool▁sep｜>(.*)\n```json\n(.*)",
+                pattern=r"<｜tool▁call▁begin｜>(.*) (.*)\n```json\n(.*)",
                 string=current_text,
                 flags=re.DOTALL,
             )
@@ -200,6 +204,4 @@ class DeepSeekV3Detector(BaseFormatDetector):
             sequence_start_token=self.bot_token,
             sequence_end_token=self.eot_token,
             tool_call_separator="",
-            call_rule_fmt='"<｜tool▁call▁begin｜>function<｜tool▁sep｜>{name}\\n```json\\n" {arguments_rule} "\\n```<｜tool▁call▁end｜>"',
-            function_format="json",
-        )
+            call_rule_fmt='"<｜tool▁call▁begin｜>function's {name}\\n```json\\n" {arguments_rule} "\\n```
