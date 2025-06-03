@@ -839,11 +839,36 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
                     delta = text[len(stream_buffer) :]
                     stream_buffer = stream_buffer + delta
                     finish_reason = content["meta_info"]["finish_reason"]
+                    finish_reason_type = (
+                        finish_reason["type"] if finish_reason else None
+                    )
+
+                    if finish_reason_type and request.tool_choice != "none" and request.tools and index in parser_dict:
+                        parser = parser_dict[index]
+                        flushed_text, flushed_calls = parser.flush()
+                        if flushed_text:
+                            # Yield any flushed text as a normal content message
+                            choice_data_flush = ChatCompletionResponseStreamChoice(
+                                index=index,
+                                delta=DeltaMessage(content=flushed_text),
+                                finish_reason=None, # Not the final finish reason for the stream if we are flushing mid-way
+                            )
+                            chunk_flush = ChatCompletionStreamResponse(
+                                id=content["meta_info"]["id"], # Use current content ID
+                                created=created,
+                                choices=[choice_data_flush],
+                                model=request.model,
+                            )
+                            yield f"data: {chunk_flush.model_dump_json()}\n\n"
+                        # Note: flushed_calls are currently ignored here. 
+                        # The design assumes tool calls are fully formed before flush or not at all.
+                        # If a partial tool call was in buffer, it becomes flushed_text.
+
                     choice_data = CompletionResponseStreamChoice(
                         index=index,
-                        text=delta,
+                        delta=delta,
                         logprobs=logprobs,
-                        finish_reason=finish_reason["type"] if finish_reason else None,
+                        finish_reason=finish_reason_type,
                         matched_stop=(
                             finish_reason["matched"]
                             if finish_reason and "matched" in finish_reason
@@ -889,14 +914,17 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
                     final_usage_chunk = CompletionStreamResponse(
                         id=content["meta_info"]["id"],
                         created=created,
-                        choices=[],
+                        choices=[
+                            ChatCompletionResponseStreamChoice(
+                                index=index,
+                                delta=DeltaMessage(),
+                                finish_reason=finish_reason_type,
+                            )
+                        ],
                         model=request.model,
                         usage=usage,
                     )
-                    final_usage_data = final_usage_chunk.model_dump_json(
-                        exclude_none=True
-                    )
-                    yield f"data: {final_usage_data}\n\n"
+                    yield f"data: {final_usage_chunk.model_dump_json()}\n\n"
             except ValueError as e:
                 error = create_streaming_error_response(str(e))
                 yield f"data: {error}\n\n"
@@ -1517,6 +1545,27 @@ async def v1_chat_completions(
                     finish_reason_type = (
                         finish_reason["type"] if finish_reason else None
                     )
+
+                    if finish_reason_type and request.tool_choice != "none" and request.tools and index in parser_dict:
+                        parser = parser_dict[index]
+                        flushed_text, flushed_calls = parser.flush()
+                        if flushed_text:
+                            # Yield any flushed text as a normal content message
+                            choice_data_flush = ChatCompletionResponseStreamChoice(
+                                index=index,
+                                delta=DeltaMessage(content=flushed_text),
+                                finish_reason=None, # Not the final finish reason for the stream if we are flushing mid-way
+                            )
+                            chunk_flush = ChatCompletionStreamResponse(
+                                id=content["meta_info"]["id"], # Use current content ID
+                                created=created,
+                                choices=[choice_data_flush],
+                                model=request.model,
+                            )
+                            yield f"data: {chunk_flush.model_dump_json()}\n\n"
+                        # Note: flushed_calls are currently ignored here. 
+                        # The design assumes tool calls are fully formed before flush or not at all.
+                        # If a partial tool call was in buffer, it becomes flushed_text.
 
                     if is_first:
                         # First chunk with role

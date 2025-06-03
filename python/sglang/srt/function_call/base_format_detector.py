@@ -73,6 +73,24 @@ class BaseFormatDetector(ABC):
         action = json.loads(text)
         return StreamingParseResult(calls=self.parse_base_json(action, tools))
 
+    def flush(self) -> StreamingParseResult:
+        """
+        Called when the stream is ending. Returns any remaining content in the
+        internal buffer as normal text and resets streaming state.
+        """
+        remaining_text = self._buffer
+        self._buffer = ""
+        
+        # Reset state variables defined in BaseFormatDetector
+        self.prev_tool_call_arr = []
+        self.current_tool_id = -1 # Important for detectors that use this state
+        self.current_tool_name_sent = False
+        self.streamed_args_for_tool = []
+        
+        # bot_token, eot_token, tool_call_separator are part of __init__ and typically don't change per-stream.
+        
+        return StreamingParseResult(normal_text=remaining_text, calls=[])
+
     def _ends_with_partial_token(self, buffer: str, bot_token: str) -> int:
         """
         Check if buffer ends with a partial bot_token.

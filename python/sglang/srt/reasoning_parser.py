@@ -78,6 +78,28 @@ class BaseReasoningFormatDetector:
 
         # Continue with reasoning content
         if self._in_reasoning:
+            # Check for tool call markers that indicate reasoning has ended
+            # This is especially important for DeepSeek-R1 which doesn't always use </think>
+            tool_call_markers = [
+                "<｜tool▁calls▁begin｜>",
+                "<｜tool▁call▁begin｜>",
+            ]
+            
+            for marker in tool_call_markers:
+                if marker in current_text:
+                    # Found tool call marker - reasoning has ended
+                    marker_idx = current_text.find(marker)
+                    reasoning_text = current_text[:marker_idx]
+                    tool_call_text = current_text[marker_idx:]
+                    
+                    self._buffer = ""
+                    self._in_reasoning = False
+                    
+                    return StreamingParseResult(
+                        normal_text=tool_call_text, 
+                        reasoning_text=reasoning_text.rstrip()
+                    )
+            
             if self.stream_reasoning:
                 # Stream the content immediately
                 self._buffer = ""

@@ -102,6 +102,20 @@ class FunctionCallParser:
 
         return final_normal_text, final_calls
 
+    def flush(self) -> Tuple[str, list[ToolCallItem]]:
+        """
+        Called at the end of a stream to flush any remaining content from the detector's buffer.
+        
+        Returns:
+            A tuple containing:
+            - The remaining normal text from the detector's buffer.
+            - A list of any tool calls parsed from the flushed content (ideally empty).
+        """
+        if hasattr(self.detector, 'flush') and callable(getattr(self.detector, 'flush')):
+            flushed_result = self.detector.flush()
+            return flushed_result.normal_text, flushed_result.calls or []
+        return "", [] # Default if detector has no flush method
+
     def get_structure_tag(self) -> StructuralTagResponseFormat:
         """
         Generate a structural tag response format for all available tools.
