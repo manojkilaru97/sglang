@@ -134,10 +134,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 "asset_dir": asset_dir,
                 "asset_ids": [i.strip() for i in asset_ids.split(",") if i.strip()],
             }
-            logger.info(f"NVCF assets detected: {self._nvcf_assets}")
         else:
             self._nvcf_assets = None
-            logger.info("No NVCF assets found in headers")
 
         return await super().handle_request(request, raw_request)
 
@@ -247,51 +245,38 @@ class OpenAIServingChat(OpenAIServingBase):
             # Process inline media tags for string content before template processing
             if isinstance(message.content, str) and is_multimodal:
                 content_str = message.content
-                logger.info(f"Checking string content for media tags: {content_str}")
-                
                 # Parse <img> and <video> tags similar to conversation.py
                 img_pattern = re.compile(r'<img\s+src="([^"]+)"\s*/>')
                 vid_pattern = re.compile(r'<video\s+src="([^"]+)"\s*/?>')
                 
-                # Debug: test patterns individually
-                img_matches = list(img_pattern.finditer(content_str))
-                vid_matches = list(vid_pattern.finditer(content_str))
-                logger.info(f"Image matches: {len(img_matches)}, Video matches: {len(vid_matches)}")
-                
                 all_matches = sorted(
-                    img_matches + vid_matches,
+                    list(img_pattern.finditer(content_str))
+                    + list(vid_pattern.finditer(content_str)),
                     key=lambda m: m.start(),
                 )
-                logger.info(f"Found {len(all_matches)} media matches")
 
                 if all_matches:
                     # Replace tags with placeholders and collect media URLs
                     segments = []
                     current_pos = 0
-                    logger.info(f"Processing {len(all_matches)} media tags")
                     for match in all_matches:
                         segments.append(content_str[current_pos : match.start()])
                         src = match.group(1)
-                        logger.info(f"Processing media src: {src}")
                         # Load media data immediately if it's NVCF asset or base64
                         media_data = _load_media_data(src, self._nvcf_assets)
-                        logger.info(f"Media data type: {type(media_data)}, size: {len(media_data) if isinstance(media_data, (bytes, bytearray)) else 'N/A'}")
                         
                         if match.re.pattern == img_pattern.pattern:
                             segments.append("<image>")  # Use standard placeholder
                             image_data.append(media_data)
-                            logger.info("Added image data")
                         else:
                             segments.append("<video>")  # Use standard placeholder  
                             video_data.append(media_data)
-                            logger.info("Added video data")
                         current_pos = match.end()
                     segments.append(content_str[current_pos:])
                     
                     # Update the message content with processed text
                     processed_content = "".join(segments)
                     msg_dict["content"] = processed_content
-                    logger.info(f"Processed content: {processed_content}")
 
             # Process content based on detected template format
             processed_msg = process_content_for_template_format(
