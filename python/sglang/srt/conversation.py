@@ -27,11 +27,76 @@ Key components:
 # https://github.com/lm-sys/FastChat/blob/main/fastchat/conversation.py
 import dataclasses
 import re
+import os
+import base64
+import logging
 from enum import IntEnum, auto
-from typing import Callable, Dict, List, Optional, Tuple, Union
+from io import BytesIO
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+
+# PIL is optional – fall back to raw bytes if not available.
+try:
+    from PIL import Image  # type: ignore
+except ImportError:  # pragma: no cover
+    Image = None  # noqa: N818
 
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 from sglang.srt.utils import read_system_prompt_from_file
+
+logger = logging.getLogger(__name__)
+
+
+def _load_media_data(src: str, nvcf_assets: Optional[Dict[str, Any]] = None):
+    """Return bytes or PIL.Image for inline-base64 or NVCF asset URIs.
+
+    The *src* string can be one of:
+        • data:image/...;base64,<b64>
+        • data:video/...;base64,<b64>
+        • data:image/...;asset_id,<id>
+        • data:video/...;asset_id,<id>
+        • regular http/https URL (left untouched – return original string)
+    """
+    if not isinstance(src, str):
+        return src  # leave unknown types untouched
+
+    if src.startswith("data:" ):
+        # Inline data
+        if ";base64," in src:
+            _, encoded = src.split(";base64,", 1)
+            try:
+                data = base64.b64decode(encoded)
+            except Exception:
+                logger.warning("Failed to b64-decode inline media")
+                return src
+
+            # Try returning PIL image for images; else raw bytes.
+            if src.startswith("data:image") and Image is not None:
+                try:
+                    return Image.open(BytesIO(data))
+                except Exception:  # pragma: no cover
+                    pass
+            return data
+
+        # NVCF asset reference
+        if ";asset_id," in src and nvcf_assets:
+            _, asset_id = src.split(";asset_id,", 1)
+            asset_dir = nvcf_assets.get("asset_dir")
+            if asset_dir and asset_id in nvcf_assets.get("asset_ids", []):
+                asset_path = os.path.join(asset_dir, asset_id)
+                if os.path.exists(asset_path):
+                    try:
+                        with open(asset_path, "rb") as f:
+                            data = f.read()
+                        if src.startswith("data:image") and Image is not None:
+                            return Image.open(BytesIO(data))
+                        return data
+                    except Exception as exc:  # pragma: no cover
+                        logger.warning("Failed loading NVCF asset %s: %s", asset_path, exc)
+            logger.warning("NVCF asset id %s not found", asset_id)
+            return src
+
+    # For all other cases, leave untouched (handled downstream)
+    return src
 
 
 class SeparatorStyle(IntEnum):
@@ -553,7 +618,7 @@ def _get_full_multimodal_text_prompt(
 
 
 def generate_chat_conv(
-    request: ChatCompletionRequest, template_name: str
+    request: ChatCompletionRequest, template_name: str, nvcf_assets: Optional[Dict[str, Any]] = None
 ) -> Conversation:
     conv = chat_templates[template_name].copy()
     conv = Conversation(
@@ -594,7 +659,41 @@ def generate_chat_conv(
         elif msg_role == "user":
             # Handle the various types of Chat Request content types here.
             if isinstance(message.content, str):
-                conv.append_message(conv.roles[0], message.content)
+                # Parse string content for media tags, similar to old adapter.
+                content_str = message.content
+                image_token = conv.image_token
+                video_token = conv.video_token
+
+                img_pattern = re.compile(r'<img\s+src="([^"]+)"\s*/>')
+                vid_pattern = re.compile(r'<video\s+src="([^"]+)"\s*/?>')
+                all_matches = sorted(
+                    list(img_pattern.finditer(content_str))
+                    + list(vid_pattern.finditer(content_str)),
+                    key=lambda m: m.start(),
+                )
+
+                if all_matches:
+                    segments = []
+                    current_pos = 0
+                    for match in all_matches:
+                        segments.append(content_str[current_pos : match.start()])
+                        src = match.group(1)
+                        if match.re.pattern == img_pattern.pattern:
+                            segments.append(image_token)
+                            # Load the actual media data using _load_media_data
+                            media_data = _load_media_data(src, nvcf_assets)
+                            conv.append_image(media_data)
+                        else:
+                            segments.append(video_token)
+                            # Load the actual media data using _load_media_data
+                            media_data = _load_media_data(src, nvcf_assets)
+                            conv.append_video(media_data)
+                        current_pos = match.end()
+                    segments.append(content_str[current_pos:])
+                    processed_text = "".join(segments)
+                    conv.append_message(conv.roles[0], processed_text)
+                else:
+                    conv.append_message(conv.roles[0], content_str)
             else:
                 real_content = ""
                 # calculate number of image_url
@@ -844,8 +943,8 @@ register_conv_template(
         offset=0,
         sep_style=SeparatorStyle.DeepSeekVL2,
         sep="\n\n",
-        sep2="<｜end▁of▁sentence｜>",
-        stop_str=["User:", "<｜end▁of▁sentence｜>"],
+        sep2="",
+        stop_str=["User:", ""],
     )
 )
 
@@ -901,9 +1000,9 @@ register_conv_template(
         system_template="{system_message}.",
         roles=("User", "Assistant"),
         sep="\n\n",
-        sep2="<｜end▁of▁sentence｜>",
+        sep2="",
         sep_style=SeparatorStyle.ADD_COLON_TWO,
-        stop_str=["<|User|>", "<｜end▁of▁sentence｜>"],
+        stop_str=["<|User|>", ""],
         image_token="<image_placeholder>",
     )
 )

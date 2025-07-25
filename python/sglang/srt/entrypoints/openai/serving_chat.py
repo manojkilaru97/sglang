@@ -4,6 +4,17 @@ import logging
 import time
 import uuid
 from typing import Any, AsyncGenerator, Dict, List, Optional, Union
+# Added for inline-media support
+import os
+import re
+import base64
+from io import BytesIO
+
+# PIL is optional – fall back to raw bytes if not available.
+try:
+    from PIL import Image  # type: ignore
+except ImportError:  # pragma: no cover
+    Image = None  # noqa: N818
 
 from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
@@ -42,6 +53,63 @@ from sglang.utils import convert_json_schema_to_str
 
 logger = logging.getLogger(__name__)
 
+# -----------------------------------------------------------------------------
+# Helper utilities for loading inline / NVCF-asset media
+# -----------------------------------------------------------------------------
+
+
+def _load_media_data(src: str, nvcf_assets: Optional[Dict[str, Any]] = None):
+    """Return bytes or PIL.Image for inline-base64 or NVCF asset URIs.
+
+    The *src* string can be one of:
+        • data:image/...;base64,<b64>
+        • data:video/...;base64,<b64>
+        • data:image/...;asset_id,<id>
+        • data:video/...;asset_id,<id>
+        • regular http/https URL (left untouched – return original string)
+    """
+    if not isinstance(src, str):
+        return src  # leave unknown types untouched
+
+    if src.startswith("data:" ):
+        # Inline data
+        if ";base64," in src:
+            _, encoded = src.split(";base64,", 1)
+            try:
+                data = base64.b64decode(encoded)
+            except Exception:
+                logger.warning("Failed to b64-decode inline media")
+                return src
+
+            # Try returning PIL image for images; else raw bytes.
+            if src.startswith("data:image") and Image is not None:
+                try:
+                    return Image.open(BytesIO(data))
+                except Exception:  # pragma: no cover
+                    pass
+            return data
+
+        # NVCF asset reference
+        if ";asset_id," in src and nvcf_assets:
+            _, asset_id = src.split(";asset_id,", 1)
+            asset_dir = nvcf_assets.get("asset_dir")
+            if asset_dir and asset_id in nvcf_assets.get("asset_ids", []):
+                asset_path = os.path.join(asset_dir, asset_id)
+                if os.path.exists(asset_path):
+                    try:
+                        with open(asset_path, "rb") as f:
+                            data = f.read()
+                        if src.startswith("data:image") and Image is not None:
+                            return Image.open(BytesIO(data))
+                        return data
+                    except Exception as exc:  # pragma: no cover
+                        logger.warning("Failed loading NVCF asset %s: %s", asset_path, exc)
+            logger.warning("NVCF asset id %s not found", asset_id)
+            return src
+
+    # For all other cases, leave untouched (handled downstream)
+    return src
+
 
 class OpenAIServingChat(OpenAIServingBase):
     """Handler for /v1/chat/completions requests"""
@@ -51,6 +119,27 @@ class OpenAIServingChat(OpenAIServingBase):
     ):
         super().__init__(tokenizer_manager)
         self.template_manager = template_manager
+        self._nvcf_assets: Optional[Dict[str, Any]] = None  # injected per-request
+
+    # ------------------------------------------------------------------
+    # Override handle_request to capture NVCF headers from *raw_request*
+    # ------------------------------------------------------------------
+
+    async def handle_request(self, request: ChatCompletionRequest, raw_request):  # type: ignore[override]
+        # Extract possible NVCF asset headers once per incoming HTTP request.
+        asset_dir = raw_request.headers.get("NVCF-ASSET-DIR")
+        asset_ids = raw_request.headers.get("NVCF-FUNCTION-ASSET-IDS")
+        if asset_dir and asset_ids:
+            self._nvcf_assets = {
+                "asset_dir": asset_dir,
+                "asset_ids": [i.strip() for i in asset_ids.split(",") if i.strip()],
+            }
+            logger.info(f"NVCF assets detected: {self._nvcf_assets}")
+        else:
+            self._nvcf_assets = None
+            logger.info("No NVCF assets found in headers")
+
+        return await super().handle_request(request, raw_request)
 
     def _request_id_prefix(self) -> str:
         return "chatcmpl-"
@@ -143,8 +232,8 @@ class OpenAIServingChat(OpenAIServingBase):
         prompt = ""
         prompt_ids = []
         openai_compatible_messages = []
-        image_data = []
-        video_data = []
+        image_data: List[Any] = []
+        video_data: List[Any] = []
         audio_data = []
         modalities = []
 
@@ -154,6 +243,55 @@ class OpenAIServingChat(OpenAIServingBase):
             if message.content is None:
                 message.content = ""
             msg_dict = message.model_dump()
+
+            # Process inline media tags for string content before template processing
+            if isinstance(message.content, str) and is_multimodal:
+                content_str = message.content
+                logger.info(f"Checking string content for media tags: {content_str}")
+                
+                # Parse <img> and <video> tags similar to conversation.py
+                img_pattern = re.compile(r'<img\s+src="([^"]+)"\s*/>')
+                vid_pattern = re.compile(r'<video\s+src="([^"]+)"\s*/?>')
+                
+                # Debug: test patterns individually
+                img_matches = list(img_pattern.finditer(content_str))
+                vid_matches = list(vid_pattern.finditer(content_str))
+                logger.info(f"Image matches: {len(img_matches)}, Video matches: {len(vid_matches)}")
+                
+                all_matches = sorted(
+                    img_matches + vid_matches,
+                    key=lambda m: m.start(),
+                )
+                logger.info(f"Found {len(all_matches)} media matches")
+
+                if all_matches:
+                    # Replace tags with placeholders and collect media URLs
+                    segments = []
+                    current_pos = 0
+                    logger.info(f"Processing {len(all_matches)} media tags")
+                    for match in all_matches:
+                        segments.append(content_str[current_pos : match.start()])
+                        src = match.group(1)
+                        logger.info(f"Processing media src: {src}")
+                        # Load media data immediately if it's NVCF asset or base64
+                        media_data = _load_media_data(src, self._nvcf_assets)
+                        logger.info(f"Media data type: {type(media_data)}, size: {len(media_data) if isinstance(media_data, (bytes, bytearray)) else 'N/A'}")
+                        
+                        if match.re.pattern == img_pattern.pattern:
+                            segments.append("<image>")  # Use standard placeholder
+                            image_data.append(media_data)
+                            logger.info("Added image data")
+                        else:
+                            segments.append("<video>")  # Use standard placeholder  
+                            video_data.append(media_data)
+                            logger.info("Added video data")
+                        current_pos = match.end()
+                    segments.append(content_str[current_pos:])
+                    
+                    # Update the message content with processed text
+                    processed_content = "".join(segments)
+                    msg_dict["content"] = processed_content
+                    logger.info(f"Processed content: {processed_content}")
 
             # Process content based on detected template format
             processed_msg = process_content_for_template_format(
@@ -234,9 +372,9 @@ class OpenAIServingChat(OpenAIServingBase):
             prompt = self.tokenizer_manager.tokenizer.decode(prompt_ids)
 
         stop = request.stop
-        image_data = image_data if image_data else None
+        image_data = image_data or None
         audio_data = audio_data if audio_data else None
-        video_data = video_data if video_data else None
+        video_data = video_data or None
         modalities = modalities if modalities else []
         return MessageProcessingResult(
             prompt=prompt,
@@ -256,7 +394,7 @@ class OpenAIServingChat(OpenAIServingBase):
         """Apply conversation template"""
         prompt = ""
         prompt_ids = []
-        conv = generate_chat_conv(request, self.template_manager.chat_template_name)
+        conv = generate_chat_conv(request, self.template_manager.chat_template_name, self._nvcf_assets)
 
         # If we should continue the final assistant message, adjust the conversation.
         if (
@@ -283,8 +421,20 @@ class OpenAIServingChat(OpenAIServingBase):
         else:
             prompt = conv.get_prompt()
 
-        image_data = conv.image_data if conv.image_data else None
-        video_data = conv.video_data if conv.video_data else None
+        # Resolve any URL / inline / asset references gathered in Conversation
+        image_data = None
+        if conv.image_data:
+            image_data = [
+                _load_media_data(item, self._nvcf_assets) if isinstance(item, str) else item
+                for item in conv.image_data
+            ]
+
+        video_data = None
+        if conv.video_data:
+            video_data = [
+                _load_media_data(item, self._nvcf_assets) if isinstance(item, str) else item
+                for item in conv.video_data
+            ]
         audio_data = conv.audio_data if conv.audio_data else None
         modalities = conv.modalities if conv.modalities else []
         stop = copy.copy(conv.stop_str or [] if not request.ignore_eos else [])
