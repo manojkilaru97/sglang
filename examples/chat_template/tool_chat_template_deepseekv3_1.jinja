@@ -1,3 +1,5 @@
+{#- DeepSeek-V3.1 Chat Template with Tool Calling Support -#}
+{#- Supports both reasoning (<think>) and tool calling capabilities -#}
 {% if not add_generation_prompt is defined %}
   {% set add_generation_prompt = false %}
 {% endif %}
@@ -15,24 +17,22 @@
     {%- endif %}
   {%- endif %}
 {%- endfor %}
-
-{%- if tools is defined and tools is not none -%}
-{%- if ns.system_prompt -%}
-{%- set ns.system_prompt = ns.system_prompt + '\n\nYou have access to the following tools:\n' -%}
-{%- else -%}
-{%- set ns.system_prompt = 'You have access to the following tools:\n' -%}
-{%- endif -%}
-{%- for tool in tools -%}
-{%- set ns.system_prompt = ns.system_prompt + '- ' + tool.function.name + ': ' + tool.function.description -%}
-{%- if tool.function.parameters -%}
-{%- set ns.system_prompt = ns.system_prompt + '. Parameters: ' + tool.function.parameters | tojson -%}
-{%- endif -%}
-{%- set ns.system_prompt = ns.system_prompt + '\n' -%}
-{%- endfor -%}
-{%- set format_text = '\nWhen calling a tool, use this exact format:\n<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>EXACT_FUNCTION_NAME<｜tool▁sep｜>JSON_ARGUMENTS<｜tool▁call▁end｜><｜tool▁calls▁end｜>' -%}
-{%- set ns.system_prompt = ns.system_prompt + format_text -%}
-{%- endif -%}
-{{ bos_token }}{{ ns.system_prompt | safe }}
+{%- if tools is defined and tools is not none %}
+{%- if ns.system_prompt %}
+{%- set ns.system_prompt = ns.system_prompt + '\n\nYou are a helpful assistant with tool calling capabilities. When a tool call is required, respond with the tool call only.\n\nYou have access to the following tools:\n' %}
+{%- else %}
+{%- set ns.system_prompt = 'You are a helpful assistant with tool calling capabilities. When a tool call is required, respond with the tool call only.\n\nYou have access to the following tools:\n' %}
+{%- endif %}
+{%- for tool in tools %}
+{%- set ns.system_prompt = ns.system_prompt + '- ' + tool.function.name + ': ' + tool.function.description %}
+{%- if tool.function.parameters %}
+{%- set ns.system_prompt = ns.system_prompt + '. Parameters: ' + tool.function.parameters | tojson %}
+{%- endif %}
+{%- set ns.system_prompt = ns.system_prompt + '\n' %}
+{%- endfor %}
+{%- set ns.system_prompt = ns.system_prompt + '\nWhen calling a tool, use this exact format:\n<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>EXACT_FUNCTION_NAME<｜tool▁sep｜>JSON_ARGUMENTS<｜tool▁call▁end｜><｜tool▁calls▁end｜>\n\nIMPORTANT: Use the exact function names listed above, not generic names.' %}
+{%- endif %}
+{{ bos_token }}{{ ns.system_prompt }}
 {%- for message in messages %}
   {%- if message['role'] == 'user' %}
     {%- set ns.is_tool = false -%}
