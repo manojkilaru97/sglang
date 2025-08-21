@@ -47,10 +47,15 @@ class DeepSeekV3Detector(BaseFormatDetector):
         super().__init__()
         self.bot_token = "<｜tool▁calls▁begin｜>"
         self.eot_token = "<｜tool▁calls▁end｜>"
-        self.func_call_regex = r"<｜tool▁call▁begin｜>.*?<｜tool▁call▁end｜>"
-        self.func_detail_regex = r"<｜tool▁call▁begin｜>(.*)<｜tool▁sep｜>(.*)\n```json\n(.*)\n```<｜tool▁call▁end｜>"
+        self.func_call_regex = r"<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>.*?<｜tool▁call▁end｜>"
+        # Support the actual DeepSeek V3 format from the original template:
+        # <｜tool▁calls▁begin｜><｜tool▁call▁begin｜>FUNCTION_NAME<｜tool▁sep｜>JSON_ARGS<｜tool▁call▁end｜>
+        self.func_detail_regex = (
+            r"<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>(?P<name>[^<｜]+)<｜tool▁sep｜>(?P<args>.*?)<｜tool▁call▁end｜>"
+        )
         self._last_arguments = ""
         self.current_tool_id = -1
+        self.current_tool_name_sent = False
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a deepseek format tool call."""
@@ -68,18 +73,25 @@ class DeepSeekV3Detector(BaseFormatDetector):
         normal_text = text[:idx].strip() if idx != -1 else text
         if self.bot_token not in text:
             return StreamingParseResult(normal_text=normal_text, calls=[])
-        match_result_list = re.findall(self.func_call_regex, text, re.DOTALL)
         calls = []
+        # Look for the pattern: <｜tool▁calls▁begin｜>FUNCTION_NAME<｜tool▁sep｜>\n```json\n{args}\n```\n<｜tool▁call▁end｜>
+        m = re.search(self.func_detail_regex, text, re.DOTALL)
         try:
-            for match_result in match_result_list:
-                # Get function name
-                func_detail = re.search(self.func_detail_regex, match_result, re.DOTALL)
-                func_name = func_detail.group(2)
-                func_args = func_detail.group(3)
-                func_args = json.loads(func_args)
-                # construct match_result for parse_base_json
-                match_result = {"name": func_name, "parameters": func_args}
-                calls.extend(self.parse_base_json(match_result, tools))
+            if m:
+                func_name = (m.group("name") or "").strip()
+                args_text = (m.group("args") or "").strip()
+                try:
+                    func_args = json.loads(args_text)
+                    # Create ToolCallItem directly since the model generates its own function names
+                    calls.append(
+                        ToolCallItem(
+                            tool_index=-1,
+                            name=func_name,
+                            parameters=json.dumps(func_args, ensure_ascii=False),
+                        )
+                    )
+                except Exception:
+                    logger.warning("DeepSeekV3Detector: Failed to parse tool arguments as JSON")
             return StreamingParseResult(normal_text=normal_text, calls=calls)
         except Exception as e:
             logger.error(f"Error in detect_and_parse: {e}")
@@ -95,37 +107,46 @@ class DeepSeekV3Detector(BaseFormatDetector):
         self._buffer += new_text
         current_text = self._buffer
 
-        # Check if we have a tool call (either the start token or individual tool call)
-        has_tool_call = (
-            self.bot_token in current_text or "<｜tool▁call▁begin｜>" in current_text
-        )
+        # Check if we have a tool call (using the actual tokens from original template)
+        has_tool_call = self.bot_token in current_text and "<｜tool▁call▁begin｜>" in current_text
 
         if not has_tool_call:
+            # If we don't have a tool call pattern, return the text as normal content
+            # but filter out any tool-related tokens that shouldn't be shown to user
+            filtered_text = new_text
+            for e_token in [self.eot_token, "```", "<｜tool▁call▁end｜>", self.bot_token, "<｜tool▁call▁begin｜>", "<｜tool▁sep｜>"]:
+                if e_token in filtered_text:
+                    filtered_text = filtered_text.replace(e_token, "")
+            
+            # If we have tool call tokens but no complete pattern yet, don't return them as content
+            if any(token in new_text for token in [self.bot_token, "<｜tool▁call▁begin｜>", "<｜tool▁sep｜>"]):
+                return StreamingParseResult(normal_text="")
+            
             self._buffer = ""
-            for e_token in [self.eot_token, "```", "<｜tool▁call▁end｜>"]:
-                if e_token in new_text:
-                    new_text = new_text.replace(e_token, "")
-            return StreamingParseResult(normal_text=new_text)
+            return StreamingParseResult(normal_text=filtered_text)
 
         if not hasattr(self, "_tool_indices"):
             self._tool_indices = self._get_tool_indices(tools)
 
         calls: list[ToolCallItem] = []
         try:
+            # Match the actual DeepSeek V3 format for streaming (from original template)
+            # The model generates: <｜tool▁calls▁begin｜><｜tool▁call▁begin｜>FUNCTION_NAME<｜tool▁sep｜>JSON_ARGS
             partial_match = re.search(
-                pattern=r"<｜tool▁call▁begin｜>(.*)<｜tool▁sep｜>(.*)\n```json\n(.*)\n```.*",
+                pattern=r"<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>(?P<name>[^<｜]+?)<｜tool▁sep｜>(?P<args>.*?)(?=<｜tool▁call▁end｜>|$)",
                 string=current_text,
                 flags=re.DOTALL,
             )
             if partial_match:
-                func_name = partial_match.group(2).strip()
-                func_args_raw = partial_match.group(3).strip()
+                func_name = (partial_match.group("name") or "").strip()
+                func_args_raw = (partial_match.group("args") or "").strip()
 
                 # Initialize state if this is the first tool call
-                if self.current_tool_id == -1:
+                if not hasattr(self, 'current_tool_id') or self.current_tool_id == -1:
                     self.current_tool_id = 0
                     self.prev_tool_call_arr = []
                     self.streamed_args_for_tool = [""]
+                    self.current_tool_name_sent = False
 
                 # Ensure we have enough entries in our tracking arrays
                 while len(self.prev_tool_call_arr) <= self.current_tool_id:
@@ -167,19 +188,26 @@ class DeepSeekV3Detector(BaseFormatDetector):
                             self.current_tool_id
                         ] += argument_diff
 
-                    if _is_complete_json(func_args_raw):
+                    # Check if we have a complete tool call (either complete JSON or tool_call_end token)
+                    has_tool_call_end = "<｜tool▁call▁end｜>" in current_text
+                    
+                    if _is_complete_json(func_args_raw) or has_tool_call_end:
                         # Update the stored arguments
                         try:
-                            parsed_args = json.loads(func_args_raw)
+                            if func_args_raw:
+                                parsed_args = json.loads(func_args_raw)
+                                self.prev_tool_call_arr[self.current_tool_id][
+                                    "arguments"
+                                ] = parsed_args
+                        except json.JSONDecodeError:
+                            # If JSON parsing fails, store as string
                             self.prev_tool_call_arr[self.current_tool_id][
                                 "arguments"
-                            ] = parsed_args
-                        except json.JSONDecodeError:
-                            pass
+                            ] = func_args_raw
 
                         # Find the end of the current tool call and remove only that part from buffer
                         tool_call_end_pattern = (
-                            r"<｜tool▁call▁begin｜>.*?<｜tool▁call▁end｜>"
+                            r"<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>.*?(?:<｜tool▁call▁end｜>|$)"
                         )
                         match = re.search(
                             tool_call_end_pattern, current_text, re.DOTALL

@@ -664,9 +664,12 @@ class OpenAIServingChat(OpenAIServingBase):
             reasoning_text = None
             reasoning_parser = self.tokenizer_manager.server_args.reasoning_parser
             if reasoning_parser and request.separate_reasoning:
+                # Determine whether to force reasoning based on template or request.
+                # Support both Qwen-style `enable_thinking` and DeepSeek-style `thinking` flags.
                 is_force_reasoning = (
                     self.template_manager.force_reasoning
                     or self._get_enable_thinking_from_request(request)
+                    or self._get_thinking_from_request(request)
                 )
                 try:
                     parser = ReasoningParser(
@@ -839,6 +842,7 @@ class OpenAIServingChat(OpenAIServingBase):
             is_force_reasoning = (
                 self.template_manager.force_reasoning
                 or self._get_enable_thinking_from_request(request)
+                or self._get_thinking_from_request(request)
             )
             reasoning_parser_dict[index] = ReasoningParser(
                 self.tokenizer_manager.server_args.reasoning_parser,
@@ -865,6 +869,23 @@ class OpenAIServingChat(OpenAIServingBase):
             and request.chat_template_kwargs.get("enable_thinking") is not None
         ):
             return request.chat_template_kwargs.get("enable_thinking")
+        return False
+
+    def _get_thinking_from_request(self, request: ChatCompletionRequest) -> bool:
+        """Extracts the 'thinking' flag from request chat_template_kwargs.
+
+        DeepSeek-V3.1 supports both reasoning and non-reasoning modes controlled
+        by a `thinking` parameter in chat templates.
+
+        Returns:
+            bool: The boolean value of 'thinking' if found, otherwise False.
+        """
+        if (
+            hasattr(request, "chat_template_kwargs")
+            and request.chat_template_kwargs
+            and request.chat_template_kwargs.get("thinking") is not None
+        ):
+            return bool(request.chat_template_kwargs.get("thinking"))
         return False
 
     async def _process_tool_call_stream(

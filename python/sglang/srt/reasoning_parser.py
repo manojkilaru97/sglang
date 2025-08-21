@@ -133,11 +133,12 @@ class DeepSeekR1Detector(BaseReasoningFormatDetector):
     """
 
     def __init__(self, stream_reasoning: bool = True, force_reasoning: bool = True):
-        # DeepSeek-R1 is assumed to be reasoning until `</think>` token
+        # Respect the provided force_reasoning so callers can disable reasoning
+        # for models that support toggling (e.g., DeepSeek-V3.x non-thinking mode).
         super().__init__(
             "<think>",
             "</think>",
-            force_reasoning=True,
+            force_reasoning=force_reasoning,
             stream_reasoning=stream_reasoning,
         )
         # https://github.com/sgl-project/sglang/pull/3202#discussion_r1950153599
