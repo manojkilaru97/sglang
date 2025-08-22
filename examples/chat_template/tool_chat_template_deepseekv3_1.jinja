@@ -1,5 +1,3 @@
-{#- DeepSeek-V3.1 Chat Template with Tool Calling Support -#}
-{#- Supports both reasoning (<think>) and tool calling capabilities -#}
 {% if not add_generation_prompt is defined %}
   {% set add_generation_prompt = false %}
 {% endif %}
@@ -17,21 +15,14 @@
     {%- endif %}
   {%- endif %}
 {%- endfor %}
-{%- if tools is defined and tools is not none %}
-{%- if ns.system_prompt %}
-{%- set ns.system_prompt = ns.system_prompt + '\n\nYou are a helpful assistant with tool calling capabilities. When a tool call is required, respond with the tool call only.\n\nYou have access to the following tools:\n' %}
-{%- else %}
-{%- set ns.system_prompt = 'You are a helpful assistant with tool calling capabilities. When a tool call is required, respond with the tool call only.\n\nYou have access to the following tools:\n' %}
-{%- endif %}
-{%- for tool in tools %}
-{%- set ns.system_prompt = ns.system_prompt + '- ' + tool.function.name + ': ' + tool.function.description %}
-{%- if tool.function.parameters %}
-{%- set ns.system_prompt = ns.system_prompt + '. Parameters: ' + tool.function.parameters | tojson %}
-{%- endif %}
-{%- set ns.system_prompt = ns.system_prompt + '\n' %}
-{%- endfor %}
-{%- set ns.system_prompt = ns.system_prompt + '\nWhen calling a tool, use this exact format:\n<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>EXACT_FUNCTION_NAME<｜tool▁sep｜>JSON_ARGUMENTS<｜tool▁call▁end｜><｜tool▁calls▁end｜>\n\nIMPORTANT: Use the exact function names listed above, not generic names.' %}
-{%- endif %}
+{% if tools is defined and tools is not none -%}
+  {%- set tool_ns = namespace(text='## Tools\nYou have access to the following tools:\n') -%}
+  {%- for tool in tools -%}
+    {%- set tool_ns.text = tool_ns.text + '\n### ' + tool.function.name + '\nDescription: ' + tool.function.description + '\n\nParameters: ' + (tool.function.parameters | tojson) + '\n' -%}
+  {%- endfor -%}
+  {%- set tool_ns.text = tool_ns.text + "\nIMPORTANT: ALWAYS adhere to this exact format for tool use:\n<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>tool_call_name<｜tool▁sep｜>tool_call_arguments<｜tool▁call▁end｜>{{additional_tool_calls}}<｜tool▁calls▁end｜>\n\nWhere:\n\n- `tool_call_name` must be an exact match to one of the available tools\n- `tool_call_arguments` must be valid JSON that strictly follows the tool's Parameters Schema\n- For multiple tool calls, chain them directly without separators or spaces\n" -%}
+  {%- set ns.system_prompt = ns.system_prompt + '\n\n' + tool_ns.text -%}
+{%- endif -%}
 {{ bos_token }}{{ ns.system_prompt }}
 {%- for message in messages %}
   {%- if message['role'] == 'user' %}
