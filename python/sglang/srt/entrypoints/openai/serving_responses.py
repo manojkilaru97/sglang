@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import os
 import logging
 import time
 from contextlib import AsyncExitStack
@@ -165,6 +166,21 @@ class OpenAIServingResponses(OpenAIServingChat):
         request: ResponsesRequest,
         raw_request: Optional[Request] = None,
     ) -> Union[AsyncGenerator[str, None], ResponsesResponse, ORJSONResponse]:
+        # Optional request payload logging
+        if os.getenv("SGLANG_LOG_PAYLOADS", "0") == "1":
+            try:
+                req_dump = request.model_dump()
+                req_str = orjson.dumps(req_dump).decode()
+            except Exception:
+                req_str = ""
+            logging.getLogger("sglang.payload").info(
+                "responses.request",
+                extra={
+                    "rid": request.request_id,
+                    "endpoint": "OpenAIServingResponses",
+                    "payload": req_str,
+                },
+            )
         # Validate model
         if not self.tokenizer_manager:
             return self.create_error_response("Model not loaded")
@@ -511,6 +527,22 @@ class OpenAIServingResponses(OpenAIServingChat):
             usage=usage,
         )
 
+        # Optional response payload logging
+        if os.getenv("SGLANG_LOG_PAYLOADS", "0") == "1":
+            try:
+                res_dump = response.model_dump()
+                res_str = orjson.dumps(res_dump).decode()
+            except Exception:
+                res_str = ""
+            logging.getLogger("sglang.payload").info(
+                "responses.response",
+                extra={
+                    "rid": request.request_id,
+                    "endpoint": "OpenAIServingResponses",
+                    "payload": res_str,
+                },
+            )
+
         if request.store:
             async with self.response_store_lock:
                 stored_response = self.response_store.get(response.id)
@@ -733,6 +765,26 @@ class OpenAIServingResponses(OpenAIServingChat):
         except Exception as e:
             logger.exception("Background request failed for %s", request.request_id)
             response = self.create_error_response(str(e))
+
+        # Optional response payload logging for background
+        if os.getenv("SGLANG_LOG_PAYLOADS", "0") == "1":
+            try:
+                if hasattr(response, "model_dump"):
+                    res_str = orjson.dumps(response.model_dump()).decode()
+                elif isinstance(response, ORJSONResponse):
+                    res_str = response.body.decode() if isinstance(response.body, (bytes, bytearray)) else str(response.body)
+                else:
+                    res_str = str(response)
+            except Exception:
+                res_str = ""
+            logging.getLogger("sglang.payload").info(
+                "responses.response",
+                extra={
+                    "rid": request.request_id,
+                    "endpoint": "OpenAIServingResponses",
+                    "payload": res_str,
+                },
+            )
 
         if isinstance(response, ORJSONResponse):
             # If the request has failed, update the status to "failed"
@@ -1242,6 +1294,21 @@ class OpenAIServingResponses(OpenAIServingChat):
                 },
                 "total_tokens": usage_info.get("total_tokens", 0),
             }
+
+        # Optional response payload logging (streaming completed)
+        if os.getenv("SGLANG_LOG_PAYLOADS", "0") == "1":
+            try:
+                res_str = orjson.dumps(response_dict).decode()
+            except Exception:
+                res_str = ""
+            logging.getLogger("sglang.payload").info(
+                "responses.response",
+                extra={
+                    "rid": request.request_id,
+                    "endpoint": "OpenAIServingResponses",
+                    "payload": res_str,
+                },
+            )
 
         yield _send_event(
             openai_responses_types.ResponseCompletedEvent(
