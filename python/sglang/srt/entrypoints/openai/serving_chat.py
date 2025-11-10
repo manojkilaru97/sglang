@@ -568,13 +568,14 @@ class OpenAIServingChat(OpenAIServingBase):
                     and request.tools
                     and self.tool_call_parser
                 ):
-                    async for chunk in self._process_tool_call_stream(
+                    async for chunk, normal_text_delta in self._process_tool_call_stream(
                         index,
                         delta,
                         parser_dict,
                         content,
                         request,
                         has_tool_calls,
+                        stream_buffers,
                     ):
                         if chunk:
                             yield chunk
@@ -588,8 +589,8 @@ class OpenAIServingChat(OpenAIServingBase):
                         if remaining_chunk:
                             yield remaining_chunk
                     
-                    # When tool calls are present, don't accumulate in stream_buffers
-                    # Content should be empty/null when tool_calls exist
+                    # Note: stream_buffers now includes normal_text from tool call parser
+                    # so all tokens are captured in the final aggregated log
 
                 else:
                     # Regular content - update stream_buffers with the CLEANED delta
@@ -1148,6 +1149,7 @@ class OpenAIServingChat(OpenAIServingBase):
         content: Dict[str, Any],
         request: ChatCompletionRequest,
         has_tool_calls: Dict[int, bool],
+        stream_buffers: Dict[int, str],
     ):
         """Process tool calls in streaming response"""
         if index not in parser_dict:
@@ -1171,8 +1173,12 @@ class OpenAIServingChat(OpenAIServingBase):
         else:
             normal_text, calls = parser.parse_stream_chunk(delta)
 
-        # Yield normal text
+        # Yield normal text and accumulate in stream_buffers for final log
         if normal_text:
+            # Accumulate normal text so it appears in final aggregated log
+            stream_buffer = stream_buffers.get(index, "")
+            stream_buffers[index] = stream_buffer + normal_text
+            
             choice_data = ChatCompletionResponseStreamChoice(
                 index=index,
                 delta=DeltaMessage(content=normal_text),
@@ -1194,7 +1200,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     completion_tokens=completion_tokens,
                 )
 
-            yield f"data: {chunk.model_dump_json()}\n\n"
+            yield f"data: {chunk.model_dump_json()}\n\n", normal_text
 
         # Yield tool calls
         history_tool_calls_cnt = self._get_history_tool_calls_cnt(request)
@@ -1244,7 +1250,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     completion_tokens=completion_tokens,
                 )
 
-            yield f"data: {chunk.model_dump_json()}\n\n"
+            yield f"data: {chunk.model_dump_json()}\n\n", None
 
     def _check_for_unstreamed_tool_args(
         self,

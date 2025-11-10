@@ -111,6 +111,15 @@ class OpenAIServingBase(ABC):
             # Log request AFTER conversion with the rid
             payload_logging = os.getenv("SGLANG_LOG_PAYLOADS", "0") == "1"
             if payload_logging:
+                # Collect all incoming headers unfiltered
+                headers_json = ""
+                try:
+                    if raw_request is not None:
+                        headers_to_log = {k: v for k, v in raw_request.headers.items()}
+                        headers_json = orjson.dumps(headers_to_log).decode()
+                except Exception:
+                    headers_json = ""
+                
                 try:
                     req_dump = request.model_dump()
                 except Exception:
@@ -129,6 +138,7 @@ class OpenAIServingBase(ABC):
                         "rid": rid_hint or "",
                         "endpoint": self.__class__.__name__,
                         "payload": req_str,
+                        "headers": headers_json,
                     },
                 )
 
