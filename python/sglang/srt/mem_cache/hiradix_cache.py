@@ -1,6 +1,7 @@
 import heapq
 import json
 import logging
+import os
 import threading
 import time
 from typing import List, Optional
@@ -117,6 +118,9 @@ class HiRadixCache(RadixCache):
                 "tp_rank": self.cache_controller.tp_rank,
                 "dp_rank": self.cache_controller.dp_rank,
             }
+            # Add experiment group label for A/B testing
+            experiment_group = os.getenv("EXPERIMENT_GROUP", "default")
+            labels["experiment_group"] = experiment_group
             self.storage_metrics_collector = StorageMetricsCollector(labels=labels)
 
         # record the nodes with ongoing write through
