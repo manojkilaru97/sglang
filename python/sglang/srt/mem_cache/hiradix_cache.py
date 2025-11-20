@@ -3,6 +3,7 @@ from __future__ import annotations
 import heapq
 import json
 import logging
+import os
 import threading
 import time
 from typing import TYPE_CHECKING, List, Optional
@@ -109,7 +110,12 @@ class HiRadixCache(RadixCache):
                 "tp_rank": self.cache_controller.tp_rank,
                 "dp_rank": self.cache_controller.dp_rank,
             }
-            self.storage_metrics_collector = StorageMetricsCollector(labels=labels)
+
+            # Add experiment group label for A/B testing
+            experiment_group = os.getenv("EXPERIMENT_GROUP", "default")
+            labels["experiment_group"] = experiment_group
+            
+            self.metrics_collector = StorageMetricsCollector(labels=labels)
 
         # record the nodes with ongoing write through
         self.ongoing_write_through = {}
@@ -502,7 +508,7 @@ class HiRadixCache(RadixCache):
         if self.enable_storage:
             self.drain_storage_control_queues()
         if self.enable_storage_metrics:
-            self.storage_metrics_collector.log_storage_metrics(
+            self.metrics_collector.log_storage_metrics(
                 self.cache_controller.storage_backend.get_stats()
             )
 
@@ -546,7 +552,7 @@ class HiRadixCache(RadixCache):
             if entry is not None:
                 entry.release_host()
             if self.enable_storage_metrics:
-                self.storage_metrics_collector.log_backuped_tokens(
+                self.metrics_collector.log_backuped_tokens(
                     operation.completed_tokens
                 )
 
@@ -661,7 +667,7 @@ class HiRadixCache(RadixCache):
         self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
 
         if self.enable_storage_metrics:
-            self.storage_metrics_collector.log_prefetched_tokens(
+            self.metrics_collector.log_prefetched_tokens(
                 min_completed_tokens - matched_length
             )
 
@@ -903,44 +909,3 @@ class HiRadixCache(RadixCache):
             if self.cache_controller.write_policy != "write_back":
                 self._inc_hit_count(new_node, chunked)
         return total_prefix_length
-
-    def _collect_leaves_device(self):
-        def is_leaf(node):
-            if node.evicted:
-                return False
-            if node == self.root_node:
-                return False
-            if len(node.children) == 0:
-                return True
-            for child in node.children.values():
-                if not child.evicted:
-                    return False
-            return True
-
-        ret_list = []
-        stack = [self.root_node]
-        while stack:
-            cur_node = stack.pop()
-            if is_leaf(cur_node):
-                ret_list.append(cur_node)
-            else:
-                for cur_child in cur_node.children.values():
-                    if not cur_child.evicted:
-                        stack.append(cur_child)
-        return ret_list
-
-    def release_aborted_request(self, rid: str):
-        if rid not in self.ongoing_prefetch:
-            return
-
-        last_host_node, token_ids, host_indices, operation = self.ongoing_prefetch[rid]
-        if operation.host_indices is None:
-            return
-
-        completed_tokens, _ = self.cache_controller.terminate_prefetch(operation)
-        if self.tp_world_size > 1:
-            torch.distributed.barrier(group=self.tp_group)
-        last_host_node.release_host()
-        del self.ongoing_prefetch[rid]
-        self.cache_controller.append_host_mem_release(host_indices[:completed_tokens])
-        self.cache_controller.prefetch_tokens_occupied -= len(token_ids)

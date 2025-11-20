@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from collections import defaultdict
 from typing import TYPE_CHECKING, List, Optional
@@ -69,6 +70,11 @@ class SchedulerMetricsMixin:
             }
             if dp_rank is not None:
                 labels["dp_rank"] = dp_rank
+            
+            # Add experiment group label for A/B testing
+            experiment_group = os.getenv("EXPERIMENT_GROUP", "default")
+            labels["experiment_group"] = experiment_group
+            
             self.metrics_collector = SchedulerMetricsCollector(labels=labels)
 
     def init_kv_events(self: Scheduler, kv_events_config: Optional[str]):
