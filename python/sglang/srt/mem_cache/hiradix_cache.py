@@ -182,6 +182,9 @@ class HiRadixCache(RadixCache):
                 "pp_rank": self.cache_controller.pp_rank,
                 "pp_size": self.cache_controller.pp_size,
             }
+            # Add experiment group label for A/B testing
+            experiment_group = os.getenv("EXPERIMENT_GROUP", "default")
+            labels["experiment_group"] = experiment_group
             storage_metrics_collector = StorageMetricsCollector(labels=labels)
 
         self.enable_storage = enable_storage
@@ -191,9 +194,13 @@ class HiRadixCache(RadixCache):
         self.hicache_storage_pass_prefix_keys = hicache_storage_pass_prefix_keys
         self.enable_storage_metrics = enable_storage_metrics
         if self.enable_storage_metrics:
+            # Backwards compatible alias: some code paths still reference
+            # `self.metrics_collector`.
             self.storage_metrics_collector = storage_metrics_collector
+            self.metrics_collector = storage_metrics_collector
         else:
             self.storage_metrics_collector = None
+            self.metrics_collector = None
 
     def attach_storage_backend(
         self,
@@ -342,6 +349,8 @@ class HiRadixCache(RadixCache):
         self.enable_storage_metrics = False
         if hasattr(self, "storage_metrics_collector"):
             self.storage_metrics_collector = None
+        if hasattr(self, "metrics_collector"):
+            self.metrics_collector = None
         return True, "Detached HiCache storage backend successfully."
 
     def _force_release_pending_storage_ops(self):
@@ -873,7 +882,7 @@ class HiRadixCache(RadixCache):
         if self.enable_storage:
             self.drain_storage_control_queues()
         if self.enable_storage_metrics:
-            self.storage_metrics_collector.log_storage_metrics(
+            self.metrics_collector.log_storage_metrics(
                 self.cache_controller.storage_backend.get_stats()
             )
 
@@ -1008,7 +1017,7 @@ class HiRadixCache(RadixCache):
         self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
 
         if self.enable_storage_metrics:
-            self.storage_metrics_collector.log_prefetched_tokens(
+            self.metrics_collector.log_prefetched_tokens(
                 min_completed_tokens - matched_length
             )
 
