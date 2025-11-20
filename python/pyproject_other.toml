@@ -69,11 +69,17 @@ runtime_common = [
   "bidict",
 ]
 
+otel = [
+  "opentelemetry-api==1.38.0",
+  "opentelemetry-exporter-otlp==1.38.0",
+  "opentelemetry-exporter-otlp-proto-grpc==1.38.0",
+  "opentelemetry-sdk==1.38.0",
+]
 tracing = [
-  "opentelemetry-sdk",
   "opentelemetry-api",
   "opentelemetry-exporter-otlp",
   "opentelemetry-exporter-otlp-proto-grpc",
+  "opentelemetry-sdk",
 ]
 
 # HIP (Heterogeneous-computing Interface for Portability) for AMD
@@ -98,6 +104,15 @@ diffusion_hip = [
   "st_attn==0.0.7",
   "vsa==0.0.4",
   "runai_model_streamer",
+logging = [
+  "kratos-cli==4.0.93",
+]
+
+all = [
+  "opentelemetry-api==1.38.0",
+  "opentelemetry-exporter-otlp==1.38.0",
+  "opentelemetry-exporter-otlp-proto-grpc==1.38.0",
+  "opentelemetry-sdk==1.38.0",
 ]
 
 # https://docs.sglang.io/platforms/ascend_npu.html
