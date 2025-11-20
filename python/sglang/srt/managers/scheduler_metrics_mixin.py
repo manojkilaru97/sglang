@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from collections import defaultdict
 from contextlib import contextmanager
@@ -83,6 +84,11 @@ class SchedulerMetricsMixin:
             }
             if dp_rank is not None:
                 labels["dp_rank"] = dp_rank
+            
+            # Add experiment group label for A/B testing
+            experiment_group = os.getenv("EXPERIMENT_GROUP", "default")
+            labels["experiment_group"] = experiment_group
+            
             self.metrics_collector = SchedulerMetricsCollector(labels=labels)
 
             if ENABLE_METRICS_DEVICE_TIMER:
