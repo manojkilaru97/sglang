@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 import uuid
 from abc import ABC, abstractmethod
@@ -102,16 +103,75 @@ class OpenAIServingBase(ABC):
             )
             if hasattr(adapted_request, "validation_time"):
                 adapted_request.validation_time = validation_time
+            
+            # Generate rid if not provided (for logging correlation)
+            if adapted_request.rid is None:
+                adapted_request.rid = uuid.uuid4().hex
+            
+            # Log request AFTER conversion with the rid
+            payload_logging = os.getenv("SGLANG_LOG_PAYLOADS", "0") == "1"
+            if payload_logging:
+                # Collect all incoming headers unfiltered
+                headers_json = ""
+                try:
+                    if raw_request is not None:
+                        headers_to_log = {k: v for k, v in raw_request.headers.items()}
+                        headers_json = orjson.dumps(headers_to_log).decode()
+                except Exception:
+                    headers_json = ""
+                
+                try:
+                    req_dump = request.model_dump()
+                except Exception:
+                    req_dump = None
+                try:
+                    rid_hint = getattr(adapted_request, "rid", None)
+                except Exception:
+                    rid_hint = None
+                try:
+                    req_str = orjson.dumps(req_dump).decode() if req_dump is not None else ""
+                except Exception:
+                    req_str = ""
+                logging.getLogger("sglang.payload").info(
+                    "openai.request",
+                    extra={
+                        "rid": rid_hint or "",
+                        "endpoint": self.__class__.__name__,
+                        "payload": req_str,
+                        "headers": headers_json,
+                    },
+                )
 
             # Note(Xinyuan): raw_request below is only used for detecting the connection of the client
             if hasattr(request, "stream") and request.stream:
-                return await self._handle_streaming_request(
+                result = await self._handle_streaming_request(
                     adapted_request, processed_request, raw_request
                 )
             else:
-                return await self._handle_non_streaming_request(
+                result = await self._handle_non_streaming_request(
                     adapted_request, processed_request, raw_request
                 )
+
+            if payload_logging and not isinstance(result, StreamingResponse):
+                try:
+                    if hasattr(result, "model_dump"):
+                        res_dump = result.model_dump()
+                        res_str = orjson.dumps(res_dump).decode()
+                    elif isinstance(result, ORJSONResponse):
+                        res_str = result.body.decode() if isinstance(result.body, (bytes, bytearray)) else str(result.body)
+                    else:
+                        res_str = str(result)
+                except Exception:
+                    res_str = ""
+                logging.getLogger("sglang.payload").info(
+                    "openai.response",
+                    extra={
+                        "rid": getattr(processed_request, "rid", None) or getattr(request, "rid", ""),
+                        "endpoint": self.__class__.__name__,
+                        "payload": res_str,
+                    },
+                )
+            return result
         except HTTPException as e:
             return self.create_error_response(
                 message=e.detail, err_type=str(e.status_code), status_code=e.status_code
