@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import os
 import time
 from collections import defaultdict
 from contextlib import contextmanager
@@ -120,6 +121,10 @@ class SchedulerMetricsMixin:
             }
             if dp_rank is not None:
                 labels["dp_rank"] = dp_rank
+
+            # Add experiment group label for A/B testing.
+            labels["experiment_group"] = os.getenv("EXPERIMENT_GROUP", "default")
+
             if self.server_args.extra_metric_labels:
                 labels.update(self.server_args.extra_metric_labels)
             self.metrics_collector = SchedulerMetricsCollector(

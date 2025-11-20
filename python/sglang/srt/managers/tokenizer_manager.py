@@ -437,6 +437,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             if self.server_args.tokenizer_metrics_allowed_custom_labels:
                 for label in self.server_args.tokenizer_metrics_allowed_custom_labels:
                     labels[label] = ""
+
+            # Add experiment group label for A/B testing.
+            labels["experiment_group"] = os.getenv("EXPERIMENT_GROUP", "default")
+
             if self.server_args.extra_metric_labels:
                 labels.update(self.server_args.extra_metric_labels)
             self.metrics_collector = TokenizerMetricsCollector(
