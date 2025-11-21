@@ -103,11 +103,20 @@ class OpenAIServingBase(ABC):
             )
             if hasattr(adapted_request, "validation_time"):
                 adapted_request.validation_time = validation_time
-            
+
             # Generate rid if not provided (for logging correlation)
             if adapted_request.rid is None:
                 adapted_request.rid = uuid.uuid4().hex
-            
+
+            # Derive a stable rid value for logging from internal/external request
+            rid_for_logging = getattr(adapted_request, "rid", None)
+            if rid_for_logging is None:
+                rid_for_logging = getattr(processed_request, "rid", None)
+            if rid_for_logging is None:
+                rid_for_logging = getattr(request, "rid", None)
+            if rid_for_logging is None:
+                rid_for_logging = ""
+
             # Log request AFTER conversion with the rid
             payload_logging = os.getenv("SGLANG_LOG_PAYLOADS", "0") == "1"
             if payload_logging:
@@ -119,23 +128,21 @@ class OpenAIServingBase(ABC):
                         headers_json = orjson.dumps(headers_to_log).decode()
                 except Exception:
                     headers_json = ""
-                
+
                 try:
                     req_dump = request.model_dump()
                 except Exception:
                     req_dump = None
                 try:
-                    rid_hint = getattr(adapted_request, "rid", None)
-                except Exception:
-                    rid_hint = None
-                try:
-                    req_str = orjson.dumps(req_dump).decode() if req_dump is not None else ""
+                    req_str = (
+                        orjson.dumps(req_dump).decode() if req_dump is not None else ""
+                    )
                 except Exception:
                     req_str = ""
                 logging.getLogger("sglang.payload").info(
                     "openai.request",
                     extra={
-                        "rid": rid_hint or "",
+                        "rid": rid_for_logging,
                         "endpoint": self.__class__.__name__,
                         "payload": req_str,
                         "headers": headers_json,
@@ -158,7 +165,11 @@ class OpenAIServingBase(ABC):
                         res_dump = result.model_dump()
                         res_str = orjson.dumps(res_dump).decode()
                     elif isinstance(result, ORJSONResponse):
-                        res_str = result.body.decode() if isinstance(result.body, (bytes, bytearray)) else str(result.body)
+                        res_str = (
+                            result.body.decode()
+                            if isinstance(result.body, (bytes, bytearray))
+                            else str(result.body)
+                        )
                     else:
                         res_str = str(result)
                 except Exception:
@@ -166,7 +177,7 @@ class OpenAIServingBase(ABC):
                 logging.getLogger("sglang.payload").info(
                     "openai.response",
                     extra={
-                        "rid": getattr(processed_request, "rid", None) or getattr(request, "rid", ""),
+                        "rid": rid_for_logging,
                         "endpoint": self.__class__.__name__,
                         "payload": res_str,
                     },
