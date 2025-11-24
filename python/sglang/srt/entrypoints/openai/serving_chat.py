@@ -822,7 +822,8 @@ class OpenAIServingChat(OpenAIServingBase):
                     extra={
                         "rid": getattr(adapted_request, "rid", ""),
                         "endpoint": self.__class__.__name__,
-                        "payload": json.dumps(response_payload),
+                        # Log structured JSON; exporter will handle serialization
+                        "payload": response_payload,
                     },
                 )
         except Exception as log_err:
