@@ -122,9 +122,11 @@ class OpenAIServingBase(ABC):
             if payload_logging:
                 # Collect all incoming headers unfiltered
                 headers_json = ""
+                headers_obj = None
                 try:
                     if raw_request is not None:
                         headers_to_log = {k: v for k, v in raw_request.headers.items()}
+                        headers_obj = headers_to_log
                         headers_json = orjson.dumps(headers_to_log).decode()
                 except Exception:
                     headers_json = ""
@@ -133,19 +135,16 @@ class OpenAIServingBase(ABC):
                     req_dump = request.model_dump()
                 except Exception:
                     req_dump = None
-                try:
-                    req_str = (
-                        orjson.dumps(req_dump).decode() if req_dump is not None else ""
-                    )
-                except Exception:
-                    req_str = ""
+
                 logging.getLogger("sglang.payload").info(
                     "openai.request",
                     extra={
                         "rid": rid_for_logging,
                         "endpoint": self.__class__.__name__,
-                        "payload": req_str,
-                        "headers": headers_json,
+                        # Prefer structured JSON payload; fall back to string in exporter
+                        "payload": req_dump if req_dump is not None else None,
+                        # Keep raw headers JSON as separate field for easier consumption
+                        "headers": headers_obj if headers_obj is not None else headers_json,
                     },
                 )
 
@@ -162,24 +161,32 @@ class OpenAIServingBase(ABC):
             if payload_logging and not isinstance(result, StreamingResponse):
                 try:
                     if hasattr(result, "model_dump"):
+                        # Pydantic-style response with structured data
                         res_dump = result.model_dump()
-                        res_str = orjson.dumps(res_dump).decode()
+                        payload_obj = res_dump
                     elif isinstance(result, ORJSONResponse):
-                        res_str = (
+                        # FastAPI ORJSONResponse; try to parse JSON body
+                        body = (
                             result.body.decode()
                             if isinstance(result.body, (bytes, bytearray))
                             else str(result.body)
                         )
+                        try:
+                            payload_obj = orjson.loads(body)
+                        except Exception:
+                            payload_obj = body
                     else:
-                        res_str = str(result)
+                        # Fallback to string representation
+                        payload_obj = str(result)
                 except Exception:
-                    res_str = ""
+                    payload_obj = None
                 logging.getLogger("sglang.payload").info(
                     "openai.response",
                     extra={
                         "rid": rid_for_logging,
                         "endpoint": self.__class__.__name__,
-                        "payload": res_str,
+                        # Structured JSON when possible; exporter can serialize appropriately
+                        "payload": payload_obj,
                     },
                 )
             return result

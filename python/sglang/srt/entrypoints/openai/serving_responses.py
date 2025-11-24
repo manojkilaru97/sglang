@@ -170,15 +170,15 @@ class OpenAIServingResponses(OpenAIServingChat):
         if os.getenv("SGLANG_LOG_PAYLOADS", "0") == "1":
             try:
                 req_dump = request.model_dump()
-                req_str = orjson.dumps(req_dump).decode()
             except Exception:
-                req_str = ""
+                req_dump = None
             logging.getLogger("sglang.payload").info(
                 "responses.request",
                 extra={
                     "rid": request.request_id,
                     "endpoint": "OpenAIServingResponses",
-                    "payload": req_str,
+                    # Prefer structured JSON payload
+                    "payload": req_dump if req_dump is not None else None,
                 },
             )
         # Validate model
@@ -531,15 +531,15 @@ class OpenAIServingResponses(OpenAIServingChat):
         if os.getenv("SGLANG_LOG_PAYLOADS", "0") == "1":
             try:
                 res_dump = response.model_dump()
-                res_str = orjson.dumps(res_dump).decode()
             except Exception:
-                res_str = ""
+                res_dump = None
             logging.getLogger("sglang.payload").info(
                 "responses.response",
                 extra={
                     "rid": request.request_id,
                     "endpoint": "OpenAIServingResponses",
-                    "payload": res_str,
+                    # Structured JSON payload instead of pre-serialized string
+                    "payload": res_dump if res_dump is not None else None,
                 },
             )
 
@@ -770,19 +770,24 @@ class OpenAIServingResponses(OpenAIServingChat):
         if os.getenv("SGLANG_LOG_PAYLOADS", "0") == "1":
             try:
                 if hasattr(response, "model_dump"):
-                    res_str = orjson.dumps(response.model_dump()).decode()
+                    res_dump = response.model_dump()
                 elif isinstance(response, ORJSONResponse):
-                    res_str = response.body.decode() if isinstance(response.body, (bytes, bytearray)) else str(response.body)
+                    body = response.body.decode() if isinstance(response.body, (bytes, bytearray)) else str(response.body)
+                    try:
+                        res_dump = orjson.loads(body)
+                    except Exception:
+                        res_dump = body
                 else:
-                    res_str = str(response)
+                    res_dump = str(response)
             except Exception:
-                res_str = ""
+                res_dump = None
             logging.getLogger("sglang.payload").info(
                 "responses.response",
                 extra={
                     "rid": request.request_id,
                     "endpoint": "OpenAIServingResponses",
-                    "payload": res_str,
+                    # Structured JSON when available
+                    "payload": res_dump,
                 },
             )
 
@@ -1298,15 +1303,16 @@ class OpenAIServingResponses(OpenAIServingChat):
         # Optional response payload logging (streaming completed)
         if os.getenv("SGLANG_LOG_PAYLOADS", "0") == "1":
             try:
-                res_str = orjson.dumps(response_dict).decode()
+                res_dump = response_dict
             except Exception:
-                res_str = ""
+                res_dump = None
             logging.getLogger("sglang.payload").info(
                 "responses.response",
                 extra={
                     "rid": request.request_id,
                     "endpoint": "OpenAIServingResponses",
-                    "payload": res_str,
+                    # Structured JSON payload
+                    "payload": res_dump,
                 },
             )
 
