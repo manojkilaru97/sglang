@@ -220,7 +220,10 @@ class CompletionRequest(BaseModel):
     frequency_penalty: float = 0.0
     logit_bias: Optional[Dict[str, float]] = None
     logprobs: Optional[int] = None
-    max_tokens: int = 16
+    max_tokens: Optional[int] = Field(
+        default=None,
+        description="Maximum number of tokens to generate. When null, auto-computes as context_length - prompt_length.",
+    )
     n: int = 1
     presence_penalty: float = 0.0
     seed: Optional[int] = None
@@ -621,10 +624,15 @@ class ChatCompletionRequest(BaseModel):
         stop: List[str],
         model_generation_config: Dict[str, Any],
         tool_call_constraint: Optional[ToolCallConstraint] = None,
+        context_length: Optional[int] = None,
+        prompt_length: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
         Convert request to sampling parameters.
         Priority: user value > model generation_config > OpenAI defaults
+        
+        When max_tokens/max_completion_tokens is None and context_length/prompt_length
+        are provided, automatically compute max_new_tokens = context_length - prompt_length.
         """
 
         def get_param(param_name: str):
@@ -635,9 +643,16 @@ class ChatCompletionRequest(BaseModel):
                 )
             return value
 
+        # Handle max_tokens: when null, compute from context_length - prompt_length
+        max_new_tokens = self.max_tokens or self.max_completion_tokens
+        if max_new_tokens is None and context_length is not None and prompt_length is not None:
+            # Auto-compute max_output_tokens when not specified
+            # Leave some buffer (2 tokens) for safety
+            max_new_tokens = max(1, context_length - prompt_length - 2)
+
         sampling_params = {
             "temperature": get_param("temperature"),
-            "max_new_tokens": self.max_tokens or self.max_completion_tokens,
+            "max_new_tokens": max_new_tokens,
             "min_new_tokens": self.min_tokens,
             "stop": stop,
             "stop_token_ids": self.stop_token_ids,

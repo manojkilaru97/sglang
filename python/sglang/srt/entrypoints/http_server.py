@@ -288,10 +288,14 @@ async def lifespan(fast_api_app: FastAPI):
 
     # Initialize OpenAI serving handlers
     fast_api_app.state.openai_serving_completion = OpenAIServingCompletion(
-        _global_state.tokenizer_manager, _global_state.template_manager
+        _global_state.tokenizer_manager,
+        _global_state.template_manager,
+        enable_force_include_usage=server_args.enable_force_include_usage,
     )
     fast_api_app.state.openai_serving_chat = OpenAIServingChat(
-        _global_state.tokenizer_manager, _global_state.template_manager
+        _global_state.tokenizer_manager,
+        _global_state.template_manager,
+        enable_force_include_usage=server_args.enable_force_include_usage,
     )
     fast_api_app.state.openai_serving_embedding = OpenAIServingEmbedding(
         _global_state.tokenizer_manager, _global_state.template_manager
@@ -336,7 +340,7 @@ async def lifespan(fast_api_app: FastAPI):
             _global_state.tokenizer_manager,
             _global_state.template_manager,
             enable_prompt_tokens_details=True,
-            enable_force_include_usage=True,
+            enable_force_include_usage=server_args.enable_force_include_usage,
             tool_server=tool_server,
         )
     except Exception:

@@ -41,9 +41,11 @@ class OpenAIServingCompletion(OpenAIServingBase):
         self,
         tokenizer_manager: TokenizerManager,
         template_manager: TemplateManager,
+        enable_force_include_usage: bool = False,
     ):
         super().__init__(tokenizer_manager)
         self.template_manager = template_manager
+        self.enable_force_include_usage = enable_force_include_usage
 
     def _request_id_prefix(self) -> str:
         return "cmpl-"
@@ -79,16 +81,34 @@ class OpenAIServingCompletion(OpenAIServingBase):
         else:
             logprob_start_len = -1
 
-        # Build sampling parameters
-        sampling_params = self._build_sampling_params(request)
-
-        # Determine prompt format
+        # Determine prompt format and compute prompt_length for auto max_tokens
+        prompt_length = None
         if isinstance(prompt, str) or (
             isinstance(prompt, list) and isinstance(prompt[0], str)
         ):
             prompt_kwargs = {"text": prompt}
+            # Tokenize to get length for auto max_tokens calculation
+            if request.max_tokens is None and self.tokenizer_manager.tokenizer:
+                if isinstance(prompt, str):
+                    prompt_length = len(
+                        self.tokenizer_manager.tokenizer.encode(prompt)
+                    )
+                elif isinstance(prompt, list) and prompt:
+                    # For batch, use first prompt length (approximate)
+                    prompt_length = len(
+                        self.tokenizer_manager.tokenizer.encode(prompt[0])
+                    )
         else:
             prompt_kwargs = {"input_ids": prompt}
+            # For token IDs, we already have the length
+            if isinstance(prompt, list):
+                if isinstance(prompt[0], int):
+                    prompt_length = len(prompt)
+                elif isinstance(prompt[0], list):
+                    prompt_length = len(prompt[0]) if prompt else None
+
+        # Build sampling parameters with prompt_length for auto max_tokens
+        sampling_params = self._build_sampling_params(request, prompt_length)
 
         # Extract custom labels from raw request headers
         custom_labels = self.extract_custom_labels(raw_request)
@@ -127,12 +147,28 @@ class OpenAIServingCompletion(OpenAIServingBase):
 
         return adapted_request, request
 
-    def _build_sampling_params(self, request: CompletionRequest) -> Dict[str, Any]:
-        """Build sampling parameters for the request"""
+    def _build_sampling_params(
+        self, request: CompletionRequest, prompt_length: Optional[int] = None
+    ) -> Dict[str, Any]:
+        """Build sampling parameters for the request
+        
+        Args:
+            request: The completion request
+            prompt_length: Length of the prompt in tokens (used for auto max_tokens calculation)
+        """
+        # Handle max_tokens: when null, compute from context_length - prompt_length
+        max_new_tokens = request.max_tokens
+        if max_new_tokens is None:
+            context_len = self.tokenizer_manager.context_len
+            if prompt_length is not None and context_len is not None:
+                # Auto-compute max_output_tokens when not specified
+                # Leave some buffer (2 tokens) for safety
+                max_new_tokens = max(1, context_len - prompt_length - 2)
+        
         # Start with common parameters
         sampling_params = {
             "temperature": request.temperature,
-            "max_new_tokens": request.max_tokens,
+            "max_new_tokens": max_new_tokens,
             "min_new_tokens": request.min_tokens,
             "stop": request.stop,
             "stop_token_ids": request.stop_token_ids,
@@ -310,8 +346,11 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         )
                         yield f"data: {hidden_states_chunk.model_dump_json()}\n\n"
 
-            # Handle final usage chunk
-            if request.stream_options and request.stream_options.include_usage:
+            # Handle final usage chunk - send if force enabled or explicitly requested
+            should_include_usage = self.enable_force_include_usage or (
+                request.stream_options and request.stream_options.include_usage
+            )
+            if should_include_usage:
                 usage = UsageProcessor.calculate_streaming_usage(
                     prompt_tokens,
                     completion_tokens,

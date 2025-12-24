@@ -369,6 +369,7 @@ class ServerArgs:
     completion_template: Optional[str] = None
     file_storage_path: str = "sglang_storage"
     enable_cache_report: bool = False
+    enable_force_include_usage: bool = False
     reasoning_parser: Optional[str] = None
     tool_call_parser: Optional[str] = None
     tool_server: Optional[str] = None
@@ -3164,6 +3165,11 @@ class ServerArgs:
             "--enable-cache-report",
             action="store_true",
             help="Return number of cached tokens in usage.prompt_tokens_details for each openai request.",
+        )
+        parser.add_argument(
+            "--enable-force-include-usage",
+            action="store_true",
+            help="Always include token usage in the final streaming chunk, even if stream_options.include_usage is not set by the client.",
         )
         parser.add_argument(
             "--reasoning-parser",

@@ -47,6 +47,7 @@ from sglang.utils import (
     TypeBasedDispatcher,
     find_printable_text,
     get_exception_traceback,
+    has_incomplete_utf8_suffix,
 )
 
 logger = logging.getLogger(__name__)
@@ -269,7 +270,8 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             new_text = read_texts[i][len(surr_texts[i]) :]
             if recv_obj.finished_reasons[i] is None:
                 # Streaming chunk: update the decode status
-                if len(new_text) > 0 and not new_text.endswith("�"):
+                # Check for incomplete UTF-8 sequences (replacement char, ZWJ, variation selectors, etc.)
+                if len(new_text) > 0 and not has_incomplete_utf8_suffix(new_text):
                     s.decoded_text = s.decoded_text + new_text
                     s.surr_offset = s.read_offset
                     s.read_offset = len(s.decode_ids)

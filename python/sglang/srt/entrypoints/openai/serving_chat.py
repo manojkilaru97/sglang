@@ -64,11 +64,13 @@ class OpenAIServingChat(OpenAIServingBase):
         self,
         tokenizer_manager: TokenizerManager,
         template_manager: TemplateManager,
+        enable_force_include_usage: bool = False,
     ):
         super().__init__(tokenizer_manager)
         self.template_manager = template_manager
         self.tool_call_parser = self.tokenizer_manager.server_args.tool_call_parser
         self.reasoning_parser = self.tokenizer_manager.server_args.reasoning_parser
+        self.enable_force_include_usage = enable_force_include_usage
 
         # Get default sampling parameters from model's generation config
         self.default_sampling_params = (
@@ -167,11 +169,18 @@ class OpenAIServingChat(OpenAIServingBase):
         # Process messages and apply chat template
         processed_messages = self._process_messages(request, is_multimodal)
 
-        # Build sampling parameters
+        # Compute prompt length for auto max_tokens calculation
+        prompt_length = None
+        if isinstance(processed_messages.prompt_ids, list):
+            prompt_length = len(processed_messages.prompt_ids)
+
+        # Build sampling parameters with context_length and prompt_length for auto max_tokens
         sampling_params = request.to_sampling_params(
             stop=processed_messages.stop,
             model_generation_config=self.default_sampling_params,
             tool_call_constraint=processed_messages.tool_call_constraint,
+            context_length=self.tokenizer_manager.context_len,
+            prompt_length=prompt_length,
         )
 
         # Handle single vs multiple requests
@@ -729,8 +738,11 @@ class OpenAIServingChat(OpenAIServingBase):
                         )
                         yield f"data: {hidden_states_chunk.model_dump_json()}\n\n"
 
-            # Additional usage chunk
-            if request.stream_options and request.stream_options.include_usage:
+            # Additional usage chunk - send if force enabled or explicitly requested
+            should_include_usage = self.enable_force_include_usage or (
+                request.stream_options and request.stream_options.include_usage
+            )
+            if should_include_usage:
                 usage = UsageProcessor.calculate_streaming_usage(
                     prompt_tokens,
                     completion_tokens,
