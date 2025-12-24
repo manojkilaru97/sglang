@@ -283,23 +283,132 @@ def _is_chinese_char(cp: int):
     return False
 
 
+def _is_emoji_or_symbol(cp: int) -> bool:
+    """Check if codepoint is an emoji or special symbol that should be printed immediately.
+    
+    Optimized for performance with early returns and consolidated ranges.
+    Most common emoji ranges are checked first for fast-path optimization.
+    """
+    # Fast path: Most emojis are in the Supplementary Multilingual Plane (0x1Fxxx)
+    # Check this first as it's the most common case
+    if cp >= 0x1F000:
+        # Main emoji blocks - consolidated ranges for speed
+        return (
+            (0x1F300 <= cp <= 0x1F9FF)  # Misc Symbols, Emoticons, Transport (most common)
+            or (0x1FA00 <= cp <= 0x1FAFF)  # Extended symbols
+        )
+    
+    # BMP emoji and symbols (0x2xxx - 0x3xxx range)
+    if 0x2000 <= cp < 0x4000:
+        # Consolidated common ranges
+        if 0x2600 <= cp <= 0x27BF:  # Misc Symbols (2600-26FF) + Dingbats (2700-27BF)
+            return True
+        if 0x2300 <= cp <= 0x23FF:  # Misc Technical (includes watch, hourglass, etc.)
+            return True
+        if 0x2B00 <= cp <= 0x2BFF:  # Misc Symbols and Arrows
+            return True
+        if 0x2900 <= cp <= 0x297F:  # Supplemental Arrows-B
+            return True
+        # Special marks
+        if cp == 0x200D:  # Zero Width Joiner
+            return True
+        if cp == 0x3030 or cp == 0x303D or cp == 0x3297 or cp == 0x3299:
+            return True
+        # Squares and geometric shapes often used as emoji
+        if 0x25A0 <= cp <= 0x25FF:
+            return True
+        return False
+    
+    # Variation Selectors (used in emoji sequences)
+    if 0xFE00 <= cp <= 0xFE0F:
+        return True
+    
+    return False
+
+
 def find_printable_text(text: str):
-    """Returns the longest printable substring of text that contains only entire words."""
+    """Returns the longest printable substring of text that contains only entire words.
+    
+    Handles:
+    - CJK characters: Print immediately as they don't use word boundaries
+    - Emojis: Print immediately as they are complete symbols
+    - Latin text: Buffer until a word boundary (space) is found
+    - Incomplete UTF-8 sequences: Buffer until complete (detected by replacement char)
+    """
     # Borrowed from https://github.com/huggingface/transformers/blob/061580c82c2db1de9139528243e105953793f7a2/src/transformers/generation/streamers.py#L99
 
+    if len(text) == 0:
+        return ""
+    
     # After the symbol for a new line, we flush the cache.
     if text.endswith("\n"):
         return text
-    # If the last token is a CJK character, we print the characters.
-    elif len(text) > 0 and _is_chinese_char(ord(text[-1])):
+    
+    # Check if the last character is a complete multi-byte character (emoji or CJK)
+    # If so, we can print the whole text
+    last_char = text[-1]
+    last_cp = ord(last_char)
+    
+    # If the last token is a CJK character or emoji, we print the characters.
+    if _is_chinese_char(last_cp) or _is_emoji_or_symbol(last_cp):
         return text
-    # Otherwise if the penultimate token is a CJK character, we print the characters except for the last one.
-    elif len(text) > 1 and _is_chinese_char(ord(text[-2])):
-        return text[:-1]
+    
+    # Check for incomplete emoji sequences (variation selectors, ZWJ, etc.)
+    # If the last character is a combining character or variation selector, buffer it
+    if last_cp >= 0xFE00 and last_cp <= 0xFE0F:  # Variation Selectors
+        # Find where the emoji sequence starts
+        idx = len(text) - 1
+        while idx > 0:
+            prev_cp = ord(text[idx - 1])
+            if _is_emoji_or_symbol(prev_cp) or _is_chinese_char(prev_cp):
+                idx -= 1
+            else:
+                break
+        return text[:idx] if idx > 0 else ""
+    
+    # Otherwise if the penultimate token is a CJK character or emoji, 
+    # we print the characters except for the last one.
+    if len(text) > 1:
+        penultimate_cp = ord(text[-2])
+        if _is_chinese_char(penultimate_cp) or _is_emoji_or_symbol(penultimate_cp):
+            return text[:-1]
+    
     # Otherwise, prints until the last space char (simple heuristic to avoid printing incomplete words,
     # which may change with the subsequent token -- there are probably smarter ways to do this!)
-    else:
-        return text[: text.rfind(" ") + 1]
+    return text[: text.rfind(" ") + 1]
+
+
+def has_incomplete_utf8_suffix(text: str) -> bool:
+    """Check if text ends with an incomplete UTF-8 sequence or replacement character.
+    
+    This helps detect when the tokenizer has output partial multi-byte characters
+    that should be buffered until complete.
+    
+    Returns:
+        True if text ends with incomplete UTF-8 (replacement char or variation selector awaiting base)
+    """
+    if not text:
+        return False
+    
+    # Check for replacement character (indicates incomplete UTF-8 byte sequence)
+    if text.endswith("�"):
+        return True
+    
+    # Check for incomplete emoji combining sequences
+    # Zero Width Joiner (0x200D) at the end suggests more characters coming
+    if text.endswith("\u200d"):  # ZWJ
+        return True
+    
+    # Check for variation selector without a preceding base character
+    last_cp = ord(text[-1])
+    if last_cp >= 0xFE00 and last_cp <= 0xFE0F:  # Variation Selectors
+        return True
+    
+    # Skin tone modifiers (Fitzpatrick modifiers) at the end without base
+    if last_cp >= 0x1F3FB and last_cp <= 0x1F3FF:
+        return True
+    
+    return False
 
 
 class LazyImport:
