@@ -2328,6 +2328,8 @@ class TestGlm47MoeDetector(unittest.TestCase):
         tool_calls = []
         for chunk in chunks:
             result = self.detector.parse_streaming_increment(chunk, self.tools)
+            # Streaming parser must not leak GLM XML markers into normal text
+            self.assertNotIn("<tool_call>", result.normal_text or "")
             for tool_call_chunk in result.calls:
                 if (
                     hasattr(tool_call_chunk, "tool_index")
@@ -2340,6 +2342,91 @@ class TestGlm47MoeDetector(unittest.TestCase):
                         tc["name"] = tool_call_chunk.name
                     if tool_call_chunk.parameters:
                         tc["parameters"] += tool_call_chunk.parameters
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["name"], "get_weather")
+        self.assertEqual(
+            tool_calls[0]["parameters"], '{"city": "Beijing", "date": "2024-06-27"}'
+        )
+
+    def test_streaming_prefix_then_tool_call_no_leak(self):
+        """If normal text and <tool_call> appear in same chunk, prefix is emitted and <tool_call> is not leaked."""
+        chunks = [
+            "I'll check that. <tool_call>get_weather",
+            "<arg_key>city</arg_key><arg_value>Beijing</arg_value>",
+            "<arg_key>date</arg_key><arg_value>2024-06-27</arg_value></tool_call>",
+        ]
+        tool_calls = []
+        normal = ""
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            normal += result.normal_text or ""
+            self.assertNotIn("<tool_call>", result.normal_text or "")
+            for tool_call_chunk in result.calls:
+                while len(tool_calls) <= tool_call_chunk.tool_index:
+                    tool_calls.append({"name": "", "parameters": ""})
+                tc = tool_calls[tool_call_chunk.tool_index]
+                if tool_call_chunk.name:
+                    tc["name"] = tool_call_chunk.name
+                if tool_call_chunk.parameters:
+                    tc["parameters"] += tool_call_chunk.parameters
+
+        self.assertIn("I'll check that.", normal)
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["name"], "get_weather")
+        self.assertEqual(
+            tool_calls[0]["parameters"], '{"city": "Beijing", "date": "2024-06-27"}'
+        )
+
+    def test_streaming_tool_call_name_arrives_later_no_assert(self):
+        """Tool name may arrive in a later chunk; streaming parser should buffer and not assert."""
+        chunks = [
+            "<tool_call>",
+            "get_weather",
+            "<arg_key>city</arg_key><arg_value>Beijing</arg_value>",
+            "<arg_key>date</arg_key><arg_value>2024-06-27</arg_value></tool_call>",
+        ]
+        tool_calls = []
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            self.assertNotIn("<tool_call>", result.normal_text or "")
+            for tool_call_chunk in result.calls:
+                while len(tool_calls) <= tool_call_chunk.tool_index:
+                    tool_calls.append({"name": "", "parameters": ""})
+                tc = tool_calls[tool_call_chunk.tool_index]
+                if tool_call_chunk.name:
+                    tc["name"] = tool_call_chunk.name
+                if tool_call_chunk.parameters:
+                    tc["parameters"] += tool_call_chunk.parameters
+
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["name"], "get_weather")
+        self.assertEqual(
+            tool_calls[0]["parameters"], '{"city": "Beijing", "date": "2024-06-27"}'
+        )
+
+    def test_streaming_tool_call_name_split_across_chunks_no_truncate(self):
+        """If the function name is split across chunks, we must not emit a truncated name."""
+        chunks = [
+            "<tool_call>get",
+            "_weather",
+            "<arg_key>city</arg_key><arg_value>Beijing</arg_value>",
+            "<arg_key>date</arg_key><arg_value>2024-06-27</arg_value>",
+            "</tool_call>",
+        ]
+
+        tool_calls = []
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            self.assertNotIn("<tool_call>", result.normal_text or "")
+            for tool_call_chunk in result.calls:
+                while len(tool_calls) <= tool_call_chunk.tool_index:
+                    tool_calls.append({"name": "", "parameters": ""})
+                tc = tool_calls[tool_call_chunk.tool_index]
+                if tool_call_chunk.name:
+                    tc["name"] = tool_call_chunk.name
+                if tool_call_chunk.parameters:
+                    tc["parameters"] += tool_call_chunk.parameters
+
         self.assertEqual(len(tool_calls), 1)
         self.assertEqual(tool_calls[0]["name"], "get_weather")
         self.assertEqual(

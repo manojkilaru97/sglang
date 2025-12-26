@@ -408,6 +408,16 @@ class Glm47MoeDetector(BaseFormatDetector):
         if not hasattr(self, "_tool_indices"):
             self._tool_indices = self._get_tool_indices(tools)
 
+        # If normal text and tool-call marker appear in the same chunk, emit the
+        # normal prefix first and keep the tool-call part buffered for parsing.
+        # This avoids leaking "<tool_call>" into normal_text in streaming.
+        prefix = ""
+        start_idx = current_text.find(self.bot_token)
+        if start_idx > 0:
+            prefix = current_text[:start_idx]
+            self._buffer = current_text[start_idx:]
+            current_text = self._buffer
+
         calls: list[ToolCallItem] = []
         try:
             # Try to match a partial or complete tool call
@@ -418,8 +428,11 @@ class Glm47MoeDetector(BaseFormatDetector):
             )
             if partial_match:
                 func_name = partial_match.group(1).strip()
-                func_args_raw = partial_match.group(2).strip()
-                is_tool_end = partial_match.group(3)
+                raw_func_args = partial_match.group(2)
+                # group(2) is optional and can be None for chunks like "<tool_call>{name}"
+                # (args start in a later chunk). Treat it as empty.
+                func_args_raw = (raw_func_args or "").strip()
+                is_tool_end = partial_match.group(3) or ""
 
                 # Initialize state if this is the first tool call
                 if self.current_tool_id == -1:
@@ -438,7 +451,19 @@ class Glm47MoeDetector(BaseFormatDetector):
 
                 # Send tool name first if not sent yet
                 if not self.current_tool_name_sent:
-                    assert func_name, "func_name should not be empty"
+                    # In true streaming (especially with speculative decoding / chunked detokenization),
+                    # we can receive a chunk that ends right after "<tool_call>" (or "<tool_call>\n"),
+                    # before the tool name arrives in a later chunk. Buffer until name is available.
+                    if not func_name:
+                        return StreamingParseResult(normal_text=prefix, calls=[])
+                    # Also, for GLM-4.7 XML-ish format, there is no explicit delimiter between the
+                    # function name and the rest of the stream until "<arg_key>" (or "</tool_call>").
+                    # Chunk boundaries can split the function name (e.g. "<tool_call>get" then
+                    # "_current_weather<arg_key>..."). If we emit the name too early, we can lock in
+                    # a truncated name like "get". Therefore, only emit the tool name once we have
+                    # observed the arguments section start token, or the tool-call end token.
+                    if raw_func_args is None and is_tool_end != self.eot_token:
+                        return StreamingParseResult(normal_text=prefix, calls=[])
                     calls.append(
                         ToolCallItem(
                             tool_index=self.current_tool_id,
@@ -533,11 +558,13 @@ class Glm47MoeDetector(BaseFormatDetector):
                         self._reset_streaming_state()
                         return result
 
-            return StreamingParseResult(normal_text="", calls=calls)
+            return StreamingParseResult(normal_text=prefix, calls=calls)
 
         except Exception as e:
             logger.error(f"Error in parse_streaming_increment: {e}", exc_info=True)
-            return StreamingParseResult(normal_text=current_text)
+            # Do not leak tool-call markup into normal_text; keep buffering and
+            # only emit any prefix we already split out.
+            return StreamingParseResult(normal_text=prefix, calls=[])
 
     def _parse_argument_pairs(
         self, pairs: List[Tuple[str, str]], func_name: str, tools: List[Tool]
