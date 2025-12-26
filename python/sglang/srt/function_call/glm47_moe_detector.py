@@ -665,6 +665,16 @@ class Glm47MoeDetector(BaseFormatDetector):
         if not hasattr(self, "_tool_indices"):
             self._tool_indices = self._get_tool_indices(tools)
 
+        # If normal text and tool-call marker appear in the same chunk, emit the
+        # normal prefix first and keep the tool-call part buffered for parsing.
+        # This avoids leaking "<tool_call>" into normal_text in streaming.
+        prefix = ""
+        start_idx = current_text.find(self.bot_token)
+        if start_idx > 0:
+            prefix = current_text[:start_idx]
+            self._buffer = current_text[start_idx:]
+            current_text = self._buffer
+
         calls: list[ToolCallItem] = []
         try:
             # Try to match a partial or complete tool call
@@ -739,7 +749,9 @@ class Glm47MoeDetector(BaseFormatDetector):
 
         except Exception as e:
             logger.error(f"Error in parse_streaming_increment: {e}", exc_info=True)
-            return StreamingParseResult(normal_text=current_text)
+            # Do not leak tool-call markup into normal_text; keep buffering and
+            # only emit any prefix we already split out.
+            return StreamingParseResult(normal_text=prefix, calls=[])
 
         return StreamingParseResult(normal_text=normal_text, calls=calls)
 
