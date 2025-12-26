@@ -447,7 +447,11 @@ class Glm4MoeDetector(BaseFormatDetector):
 
                 # Send tool name first if not sent yet
                 if not self.current_tool_name_sent:
-                    assert func_name, "func_name should not be empty"
+                    # In true streaming, we can receive a chunk that ends right after "<tool_call>"
+                    # (or "<tool_call>\n") before the tool name arrives in a later chunk.
+                    # Buffer until name is available instead of asserting.
+                    if not func_name:
+                        return StreamingParseResult(normal_text="", calls=[])
                     calls.append(
                         ToolCallItem(
                             tool_index=self.current_tool_id,
