@@ -748,32 +748,22 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     f"model's context length ({self.context_len} tokens)."
                 )
 
-        # Validate total tokens (input + max_new_tokens)
+        # Cap max_new_tokens if it exceeds available context space.
+        # Unlike input truncation (which loses information), capping output limit is
+        # non-destructive - users often set max_tokens to the model's published context
+        # window as a "use up to this much" value.
         max_new_tokens = obj.sampling_params.get("max_new_tokens")
         if (
             self.validate_total_tokens
             and max_new_tokens is not None
             and (max_new_tokens + input_token_num) > _max_req_len
         ):
-            if self.server_args.allow_auto_truncate:
-                logger.warning(
-                    f"Requested token count ({input_token_num} input + {max_new_tokens} new) "
-                    f"exceeds the model's context length ({self.context_len} tokens). "
-                    "Truncating max_new_tokens."
-                )
-                obj.sampling_params["max_new_tokens"] = max(
-                    0, _max_req_len - input_token_num
-                )
-            else:
-                total_tokens = max_new_tokens + input_token_num
-                error_msg = (
-                    f"Requested token count exceeds the model's maximum context length "
-                    f"of {self.context_len} tokens. You requested a total of {total_tokens} "
-                    f"tokens: {input_token_num} tokens from the input messages and "
-                    f"{max_new_tokens} tokens for the completion. Please reduce the number "
-                    f"of tokens in the input messages or the completion to fit within the limit."
-                )
-                raise ValueError(error_msg)
+            capped_max_new_tokens = max(0, _max_req_len - input_token_num)
+            logger.debug(
+                f"Capping max_new_tokens from {max_new_tokens} to {capped_max_new_tokens} "
+                f"({input_token_num} input tokens, {self.context_len} context length)."
+            )
+            obj.sampling_params["max_new_tokens"] = capped_max_new_tokens
 
         # Validate embedding requests
         if isinstance(obj, EmbeddingReqInput) and self.is_generation:
