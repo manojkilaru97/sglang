@@ -1324,10 +1324,12 @@ class OpenAIServingChat(OpenAIServingBase):
             )
         if self.reasoning_parser in ["qwen3", "glm45", "nano_v3", "interns1"]:
             # qwen3, glm45, nano_v3, and interns1 are reasoning by default
-            return (
-                not request.chat_template_kwargs
-                or request.chat_template_kwargs.get("enable_thinking", True) is True
-            )
+            if not request.chat_template_kwargs:
+                return True
+            # Check "thinking" first (used by protocol normalizer), then "enable_thinking"
+            if "thinking" in request.chat_template_kwargs:
+                return request.chat_template_kwargs.get("thinking") is True
+            return request.chat_template_kwargs.get("enable_thinking", True) is True
         return True  # default
 
     async def _process_tool_call_stream(
