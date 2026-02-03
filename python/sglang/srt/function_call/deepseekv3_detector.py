@@ -47,7 +47,7 @@ class DeepSeekV3Detector(BaseFormatDetector):
         self.bot_token = "<｜tool▁calls▁begin｜>"
         self.eot_token = "<｜tool▁calls▁end｜>"
         self.func_call_regex = r"<｜tool▁call▁begin｜>.*?<｜tool▁call▁end｜>"
-        self.func_detail_regex = r"<｜tool▁call▁begin｜>(.*)<｜tool▁sep｜>(.*)\n```json\n(.*)\n```<｜tool▁call▁end｜>"
+        self.func_detail_regex = r"<｜tool▁call▁begin｜>(.*?)<｜tool▁sep｜>(.*?)\n```json\n(.*?)\n```<｜tool▁call▁end｜>"
         self._last_arguments = ""
         self.current_tool_id = -1
 
@@ -112,7 +112,7 @@ class DeepSeekV3Detector(BaseFormatDetector):
         calls: list[ToolCallItem] = []
         try:
             partial_match = re.search(
-                pattern=r"<｜tool▁call▁begin｜>(.*)<｜tool▁sep｜>(.*)\n```json\n(.*)\n```.*",
+                pattern=r"<｜tool▁call▁begin｜>(.*?)<｜tool▁sep｜>(.*?)\n```json\n(.*?)\n```",
                 string=current_text,
                 flags=re.DOTALL,
             )
