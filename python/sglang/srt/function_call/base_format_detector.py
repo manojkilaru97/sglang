@@ -164,6 +164,9 @@ class BaseFormatDetector(ABC):
 
         flags = Allow.ALL if self.current_tool_name_sent else Allow.ALL & ~Allow.STR
 
+        # Track normal text that appears before tool calls (first transition only)
+        normal_text_before_tools = ""
+
         try:
             try:
                 # Priority check: if we're processing a subsequent tool (current_tool_id > 0),
@@ -179,6 +182,13 @@ class BaseFormatDetector(ABC):
                     # Only search for bot_token if not processing subsequent tool
                     tool_call_pos = current_text.find(self.bot_token)
                     if tool_call_pos != -1:
+                        # Capture text before bot_token on first tool call transition
+                        if self.current_tool_id == -1 and tool_call_pos > 0:
+                            normal_text_before_tools = current_text[:tool_call_pos]
+                            # Update buffer to remove the normal text we're about to return
+                            self._buffer = current_text[tool_call_pos:]
+                            current_text = self._buffer
+                            tool_call_pos = 0  # bot_token is now at position 0
                         start_idx = tool_call_pos + len(self.bot_token)
                     else:
                         start_idx = 0
@@ -234,7 +244,9 @@ class BaseFormatDetector(ABC):
                             self.streamed_args_for_tool.append("")
 
                     # Send the tool name with empty parameters
+                    # Include any normal_text that appeared before the tool calls
                     res = StreamingParseResult(
+                        normal_text=normal_text_before_tools or "",
                         calls=[
                             ToolCallItem(
                                 tool_index=self.current_tool_id,
@@ -244,6 +256,12 @@ class BaseFormatDetector(ABC):
                         ],
                     )
                     self.current_tool_name_sent = True
+
+                    # Update prev_tool_call_arr so finalization knows this tool was started
+                    # This is critical for when the entire JSON comes in one chunk
+                    while len(self.prev_tool_call_arr) <= self.current_tool_id:
+                        self.prev_tool_call_arr.append({})
+                    self.prev_tool_call_arr[self.current_tool_id] = current_tool_call
                 else:
                     res = StreamingParseResult()
 

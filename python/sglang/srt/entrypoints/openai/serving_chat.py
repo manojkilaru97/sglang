@@ -669,7 +669,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 full_text_buffer = full_text_buffers.get(index, "")
                 delta = content["text"][len(full_text_buffer):]
                 full_text_buffers[index] = content["text"]
-                
+
                 # Handle reasoning content - extract reasoning and get cleaned delta
                 if self.reasoning_parser and request.separate_reasoning:
                     reasoning_text, delta = self._process_reasoning_stream(
@@ -722,14 +722,18 @@ class OpenAIServingChat(OpenAIServingBase):
                         if chunk:
                             yield chunk
 
-                    # Send any remaining tool call arguments when generation finishes
+                    # Send any remaining tool calls when generation finishes
+                    # With stream_interval > 1, tokens batch up and the parser may not have
+                    # processed all tools before finish_reason is set
                     if finish_reason_type is not None and index in parser_dict:
                         parser = parser_dict[index]
-                        remaining_chunk = self._check_for_unstreamed_tool_args(
-                            parser, content, request, index
-                        )
-                        if remaining_chunk:
-                            yield remaining_chunk
+
+                        # Do a final parse of the full content to get all tool calls
+                        full_text = content['text']
+                        async for chunk in self._finalize_tool_calls_on_finish(
+                            parser, full_text, content, request, index, has_tool_calls
+                        ):
+                            yield chunk
                     
                     # Note: stream_buffers now includes normal_text from tool call parser
                     # so all tokens are captured in the final aggregated log
@@ -1292,6 +1296,7 @@ class OpenAIServingChat(OpenAIServingBase):
         """Process tool calls in streaming response"""
         if index not in parser_dict:
             # Use JSON detector directly for required or named tool choice
+            # (xgrammar constrains output to JSON format directly)
             if request.tool_choice == "required" or isinstance(
                 request.tool_choice, ToolChoice
             ):
@@ -1390,18 +1395,157 @@ class OpenAIServingChat(OpenAIServingBase):
 
             yield f"data: {chunk.model_dump_json()}\n\n", None
 
+    async def _finalize_tool_calls_on_finish(
+        self,
+        parser: Union[FunctionCallParser, JsonArrayParser],
+        full_text: str,
+        content: Dict[str, Any],
+        request: ChatCompletionRequest,
+        index: int,
+        has_tool_calls: Dict[int, bool],
+    ):
+        """
+        When generation finishes (especially with stream_interval > 1), parse the full
+        content to extract any tool calls that weren't yielded during streaming.
+        This handles the case where tokens batch up and the streaming parser doesn't
+        get to process all tools before finish_reason is set.
+        """
+        # Get the detector
+        detector = parser.detector if hasattr(parser, "detector") else parser
+
+        # Track which tools were already streamed (have names sent)
+        already_streamed_count = len(getattr(detector, 'prev_tool_call_arr', []))
+
+        # Try to parse the full text as JSON to get all tool calls
+        try:
+            # For JsonArrayParser (tool_choice=required), the text is a JSON array
+            # When thinking is enabled, full_text may contain thinking content before the JSON
+            # e.g., "The user wants... </think>[{...}]"
+            # Extract just the JSON array portion
+            import json
+            json_text = full_text
+
+            # Find the JSON array - look for the first '[' and match to last ']'
+            bracket_start = full_text.find('[')
+            if bracket_start != -1:
+                # Find the matching closing bracket
+                bracket_end = full_text.rfind(']')
+                if bracket_end > bracket_start:
+                    json_text = full_text[bracket_start:bracket_end + 1]
+
+            tool_calls_data = json.loads(json_text)
+            if not isinstance(tool_calls_data, list):
+                tool_calls_data = [tool_calls_data]
+
+            # Yield any tools that weren't already streamed
+            history_tool_calls_cnt = self._get_history_tool_calls_cnt(request)
+
+            for i, tool_data in enumerate(tool_calls_data):
+                if i < already_streamed_count:
+                    # This tool was already streamed, but check if args are complete
+                    if i < len(detector.streamed_args_for_tool):
+                        expected_args = json.dumps(tool_data.get("parameters") or tool_data.get("arguments", {}), ensure_ascii=False)
+                        actual_args = detector.streamed_args_for_tool[i]
+                        if len(actual_args) < len(expected_args):
+                            # Send remaining arguments
+                            remaining_args = expected_args[len(actual_args):]
+                            if remaining_args:
+                                tool_call = ToolCall(
+                                    id=None,
+                                    index=i,
+                                    function=FunctionResponse(
+                                        name=None,
+                                        arguments=remaining_args,
+                                    ),
+                                )
+                                choice_data = ChatCompletionResponseStreamChoice(
+                                    index=index,
+                                    delta=DeltaMessage(tool_calls=[tool_call]),
+                                    finish_reason=None,
+                                )
+                                chunk = ChatCompletionStreamResponse(
+                                    id=content["meta_info"]["id"],
+                                    created=int(time.time()),
+                                    choices=[choice_data],
+                                    model=request.model,
+                                )
+                                yield f"data: {chunk.model_dump_json()}\n\n"
+                else:
+                    # This tool wasn't streamed at all - send name and full args
+                    has_tool_calls[index] = True
+                    tool_name = tool_data.get("name")
+                    tool_args = json.dumps(tool_data.get("parameters") or tool_data.get("arguments", {}), ensure_ascii=False)
+
+                    # Generate tool call ID
+                    tool_call_id = f"call_{uuid.uuid4().hex[:24]}"
+
+                    # Send name chunk
+                    tool_call = ToolCall(
+                        id=tool_call_id,
+                        index=i,
+                        function=FunctionResponse(
+                            name=tool_name,
+                            arguments="",
+                        ),
+                    )
+                    choice_data = ChatCompletionResponseStreamChoice(
+                        index=index,
+                        delta=DeltaMessage(tool_calls=[tool_call]),
+                        finish_reason=None,
+                    )
+                    chunk = ChatCompletionStreamResponse(
+                        id=content["meta_info"]["id"],
+                        created=int(time.time()),
+                        choices=[choice_data],
+                        model=request.model,
+                    )
+                    yield f"data: {chunk.model_dump_json()}\n\n"
+
+                    # Send args chunk
+                    tool_call = ToolCall(
+                        id=None,
+                        index=i,
+                        function=FunctionResponse(
+                            name=None,
+                            arguments=tool_args,
+                        ),
+                    )
+                    choice_data = ChatCompletionResponseStreamChoice(
+                        index=index,
+                        delta=DeltaMessage(tool_calls=[tool_call]),
+                        finish_reason=None,
+                    )
+                    chunk = ChatCompletionStreamResponse(
+                        id=content["meta_info"]["id"],
+                        created=int(time.time()),
+                        choices=[choice_data],
+                        model=request.model,
+                    )
+                    yield f"data: {chunk.model_dump_json()}\n\n"
+
+        except json.JSONDecodeError:
+            # JSON parsing failed (e.g., content has thinking text before JSON)
+            # Fall back to checking for unstreamed args only
+            remaining_chunks = self._check_for_unstreamed_tool_args(parser, content, request, index)
+            for remaining_chunk in remaining_chunks:
+                yield remaining_chunk
+
     def _check_for_unstreamed_tool_args(
         self,
         parser: Union[FunctionCallParser, JsonArrayParser],
         content: Dict[str, Any],
         request: ChatCompletionRequest,
         index: int,
-    ) -> Optional[str]:
+    ) -> List[str]:
         """
         Check for any remaining tool call arguments that need to be streamed
         when generation finishes. This ensures tool calls are properly completed
         even if the model generates the final arguments in the last chunk.
+
+        Returns a list of chunks for ALL tool calls with remaining arguments.
         """
+        chunks = []
+
         # Get the detector - either from FunctionCallParser or directly if json detector
         detector = parser.detector if hasattr(parser, "detector") else parser
 
@@ -1410,55 +1554,55 @@ class OpenAIServingChat(OpenAIServingBase):
             not hasattr(detector, "prev_tool_call_arr")
             or not detector.prev_tool_call_arr
         ):
-            return None
+            return chunks
 
         if (
             not hasattr(detector, "streamed_args_for_tool")
             or not detector.streamed_args_for_tool
         ):
-            return None
+            return chunks
 
-        # Get the last tool call that was being processed
-        tool_index = len(detector.prev_tool_call_arr) - 1
-        if tool_index < 0 or tool_index >= len(detector.streamed_args_for_tool):
-            return None
+        # Loop through ALL tool calls, not just the last one
+        for tool_index in range(len(detector.prev_tool_call_arr)):
+            if tool_index >= len(detector.streamed_args_for_tool):
+                continue
 
-        # Get expected vs actual arguments
-        expected_args = detector.prev_tool_call_arr[tool_index].get("arguments", {})
-        expected_call = json.dumps(expected_args, ensure_ascii=False)
-        actual_call = detector.streamed_args_for_tool[tool_index]
+            # Get expected vs actual arguments
+            expected_args = detector.prev_tool_call_arr[tool_index].get("arguments", {})
+            expected_call = json.dumps(expected_args, ensure_ascii=False)
+            actual_call = detector.streamed_args_for_tool[tool_index]
 
-        # Check if there are remaining arguments to send
-        remaining_call = (
-            expected_call.replace(actual_call, "", 1)
-            if actual_call in expected_call
-            else ""
-        )
-
-        if remaining_call:
-            # Create tool call chunk with remaining arguments
-            tool_call = ToolCall(
-                id=None,  # No ID for argument deltas
-                index=tool_index,
-                function=FunctionResponse(
-                    name=None,  # No name for argument deltas
-                    arguments=remaining_call,
-                ),
+            # Check if there are remaining arguments to send
+            remaining_call = (
+                expected_call.replace(actual_call, "", 1)
+                if actual_call in expected_call
+                else ""
             )
 
-            choice_data = ChatCompletionResponseStreamChoice(
-                index=index,
-                delta=DeltaMessage(tool_calls=[tool_call]),
-                finish_reason=None,  # Don't send finish_reason with this chunk
-            )
+            if remaining_call:
+                # Create tool call chunk with remaining arguments
+                tool_call = ToolCall(
+                    id=None,  # No ID for argument deltas
+                    index=tool_index,
+                    function=FunctionResponse(
+                        name=None,  # No name for argument deltas
+                        arguments=remaining_call,
+                    ),
+                )
 
-            chunk = ChatCompletionStreamResponse(
-                id=content["meta_info"]["id"],
-                created=int(time.time()),
-                choices=[choice_data],
-                model=request.model,
-            )
+                choice_data = ChatCompletionResponseStreamChoice(
+                    index=index,
+                    delta=DeltaMessage(tool_calls=[tool_call]),
+                    finish_reason=None,  # Don't send finish_reason with this chunk
+                )
 
-            return f"data: {chunk.model_dump_json()}\n\n"
+                chunk = ChatCompletionStreamResponse(
+                    id=content["meta_info"]["id"],
+                    created=int(time.time()),
+                    choices=[choice_data],
+                    model=request.model,
+                )
 
-        return None
+                chunks.append(f"data: {chunk.model_dump_json()}\n\n")
+
+        return chunks

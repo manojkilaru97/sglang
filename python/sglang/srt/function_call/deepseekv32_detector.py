@@ -241,6 +241,21 @@ class DeepSeekV32Detector(BaseFormatDetector):
             return StreamingParseResult(normal_text=current_text)
 
         all_calls: list[ToolCallItem] = []
+        normal_text_before_tools = ""
+
+        # Capture any normal text before DSML markers on FIRST tool call detection
+        # This must happen before the invoke_match loop, because the invoke regex
+        # may not match until the full tag is received
+        if self.current_tool_id == -1 and potentially_dsml:
+            dsml_start = current_text.find("<｜DSML｜")
+            if dsml_start == -1:
+                dsml_start = current_text.find(self.bot_token)
+            if dsml_start > 0:
+                normal_text_before_tools = current_text[:dsml_start].strip()  # Strip to match non-streaming behavior
+                # Update buffer to exclude the normal text we're returning
+                self._buffer = current_text[dsml_start:]
+                current_text = self._buffer
+
         try:
             # Loop to handle multiple consecutive invoke blocks
             while True:
@@ -340,7 +355,9 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     break
 
             # No more invoke blocks found
-            return StreamingParseResult(normal_text="", calls=all_calls)
+            # Include any normal_text that appeared before the tool calls
+            result_normal = normal_text_before_tools if normal_text_before_tools else ""
+            return StreamingParseResult(normal_text=result_normal, calls=all_calls)
 
         except Exception as e:
             logger.error(f"Error in parse_streaming_increment: {e}")
