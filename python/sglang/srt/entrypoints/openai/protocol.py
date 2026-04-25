@@ -601,7 +601,7 @@ class ChatCompletionRequest(BaseModel):
     @classmethod
     def normalize_dsv4_reasoning_effort(cls, values: Dict):
         effort = values.get("reasoning_effort")
-        if effort not in {"none", "high", "max"}:
+        if effort not in {"none", "low", "medium", "high", "max"}:
             return values
 
         ctk = values.get("chat_template_kwargs")
@@ -613,8 +613,9 @@ class ChatCompletionRequest(BaseModel):
             ctk.pop("reasoning_effort", None)
             values["reasoning_effort"] = None
         else:
+            dsv4_effort = "max" if effort == "max" else "high"
             ctk.setdefault("thinking", True)
-            ctk.setdefault("reasoning_effort", effort)
+            ctk.setdefault("reasoning_effort", dsv4_effort)
 
         values["chat_template_kwargs"] = ctk
         return values
