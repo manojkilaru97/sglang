@@ -541,14 +541,15 @@ class ChatCompletionRequest(BaseModel):
     )  # noqa
     return_hidden_states: bool = False
     return_routed_experts: bool = False
-    reasoning_effort: Optional[Literal["low", "medium", "high", "max"]] = Field(
+    reasoning_effort: Optional[Literal["none", "low", "medium", "high", "max"]] = Field(
         default="medium",
         description="Constrains effort on reasoning for reasoning models. "
         "'low' is the least effort, 'high' is the most effort. Reducing reasoning "
         "effort can result in faster responses and fewer tokens used on reasoning "
-        "in a response. 'max' is an sglang extension to the OpenAI schema for "
-        "models that expose a maximum-effort tier above 'high'; models that don't "
-        "support it treat it the same as 'high'.",
+        "in a response. DeepSeek V4 additionally supports 'none' and 'max'. "
+        "'max' is an sglang extension to the OpenAI schema for models that expose "
+        "a maximum-effort tier above 'high'; models that don't support it treat it "
+        "the same as 'high'.",
     )
     task: Optional[
         Literal["action", "query", "authority", "domain", "title", "read_url"]
@@ -621,6 +622,28 @@ class ChatCompletionRequest(BaseModel):
                 values["tool_choice"] = "none"
             else:
                 values["tool_choice"] = "auto"
+        return values
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_dsv4_reasoning_effort(cls, values: Dict):
+        effort = values.get("reasoning_effort")
+        if effort not in {"none", "high", "max"}:
+            return values
+
+        ctk = values.get("chat_template_kwargs")
+        if not isinstance(ctk, dict):
+            ctk = {}
+
+        if effort == "none":
+            ctk["thinking"] = False
+            ctk.pop("reasoning_effort", None)
+            values["reasoning_effort"] = None
+        else:
+            ctk.setdefault("thinking", True)
+            ctk.setdefault("reasoning_effort", effort)
+
+        values["chat_template_kwargs"] = ctk
         return values
 
     @model_validator(mode="before")
