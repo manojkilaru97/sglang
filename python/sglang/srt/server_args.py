@@ -314,6 +314,7 @@ class ServerArgs:
     max_running_requests: Optional[int] = None
     max_queued_requests: Optional[int] = None
     max_total_tokens: Optional[int] = None
+    max_output_len: Optional[int] = None
     chunked_prefill_size: Optional[int] = None
     enable_dynamic_chunking: bool = False
     max_prefill_tokens: int = 16384
@@ -362,6 +363,8 @@ class ServerArgs:
     log_requests_level: int = 2
     log_requests_format: str = "text"
     log_requests_target: Optional[List[str]] = None
+    enable_log_outputs: bool = True
+    enable_log_deltas: bool = True
     uvicorn_access_log_exclude_prefixes: List[str] = dataclasses.field(
         default_factory=lambda: list(DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES)
     )
@@ -2993,6 +2996,12 @@ class ServerArgs:
             "This option is typically used for development and debugging purposes.",
         )
         parser.add_argument(
+            "--max-output-len",
+            type=int,
+            default=ServerArgs.max_output_len,
+            help="The server-side maximum number of output tokens allowed for a request. If a request asks for more, max_new_tokens is capped to this value.",
+        )
+        parser.add_argument(
             "--chunked-prefill-size",
             type=int,
             default=ServerArgs.chunked_prefill_size,
@@ -3253,6 +3262,8 @@ class ServerArgs:
         )
         parser.add_argument(
             "--log-requests",
+            "--enable-log-requests",
+            dest="log_requests",
             action="store_true",
             help="Log metadata, inputs, outputs of all requests. The verbosity is decided by --log-requests-level",
         )
@@ -3277,6 +3288,32 @@ class ServerArgs:
             default=ServerArgs.log_requests_target,
             help="Target(s) for request logging: 'stdout' and/or directory path(s) for file output. "
             "Can specify multiple targets, e.g., '--log-requests-target stdout /my/path'. ",
+        )
+        parser.add_argument(
+            "--enable-log-outputs",
+            dest="enable_log_outputs",
+            action="store_true",
+            default=ServerArgs.enable_log_outputs,
+            help="Include request outputs in request logs.",
+        )
+        parser.add_argument(
+            "--no-enable-log-outputs",
+            dest="enable_log_outputs",
+            action="store_false",
+            help="Exclude request outputs from request logs.",
+        )
+        parser.add_argument(
+            "--enable-log-deltas",
+            dest="enable_log_deltas",
+            action="store_true",
+            default=ServerArgs.enable_log_deltas,
+            help="Compatibility flag for streaming delta logging.",
+        )
+        parser.add_argument(
+            "--no-enable-log-deltas",
+            dest="enable_log_deltas",
+            action="store_false",
+            help="Compatibility flag to disable streaming delta logging.",
         )
         parser.add_argument(
             "--uvicorn-access-log-exclude-prefixes",
@@ -5053,6 +5090,9 @@ class ServerArgs:
         assert (
             self.schedule_conservativeness >= 0
         ), "schedule_conservativeness must be non-negative"
+
+        if self.max_output_len is not None and self.max_output_len <= 0:
+            raise ValueError("--max-output-len must be positive when specified.")
 
         if self.model_impl == "mindspore":
             assert is_npu(), "MindSpore model impl is only supported on Ascend npu."
