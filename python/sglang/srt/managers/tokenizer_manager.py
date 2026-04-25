@@ -361,6 +361,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             log_requests_level=self.server_args.log_requests_level,
             log_requests_format=self.server_args.log_requests_format,
             log_requests_target=self.server_args.log_requests_target,
+            enable_log_outputs=self.server_args.enable_log_outputs,
+            enable_log_deltas=self.server_args.enable_log_deltas,
         )
 
         # Dumping
@@ -772,6 +774,19 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
         # Validate total tokens (input + max_new_tokens)
         max_new_tokens = obj.sampling_params.get("max_new_tokens")
+        max_output_len = self.server_args.max_output_len
+        if max_output_len is not None:
+            if max_new_tokens is None:
+                obj.sampling_params["max_new_tokens"] = max_output_len
+                max_new_tokens = max_output_len
+            elif max_new_tokens > max_output_len:
+                logger.info(
+                    "Capping max_new_tokens from %s to server max_output_len=%s.",
+                    max_new_tokens,
+                    max_output_len,
+                )
+                obj.sampling_params["max_new_tokens"] = max_output_len
+                max_new_tokens = max_output_len
         if (
             self.validate_total_tokens
             and max_new_tokens is not None
@@ -1406,6 +1421,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             log_requests=obj.log_requests,
             log_requests_level=obj.log_requests_level,
             log_requests_format=obj.log_requests_format,
+            enable_log_outputs=obj.enable_log_outputs,
+            enable_log_deltas=obj.enable_log_deltas,
         )
         if obj.dump_requests_folder is not None:
             self.dump_requests_folder = obj.dump_requests_folder
