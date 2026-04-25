@@ -47,11 +47,15 @@ class RequestLogger:
         log_requests_level: int,
         log_requests_format: str,
         log_requests_target: Optional[List[str]],
+        enable_log_outputs: bool = True,
+        enable_log_deltas: bool = True,
     ):
         self.log_requests = log_requests
         self.log_requests_level = log_requests_level
         self.log_requests_format = log_requests_format
         self.log_requests_target = log_requests_target
+        self.enable_log_outputs = enable_log_outputs
+        self.enable_log_deltas = enable_log_deltas
 
         self.metadata: Tuple[Optional[int], Optional[Set[str]], Optional[Set[str]]] = (
             self._compute_metadata()
@@ -71,6 +75,8 @@ class RequestLogger:
         log_requests_level: Optional[int] = None,
         log_requests_format: Optional[str] = None,
         log_requests_target: Optional[List[str]] = None,
+        enable_log_outputs: Optional[bool] = None,
+        enable_log_deltas: Optional[bool] = None,
     ) -> None:
         if log_requests is not None:
             self.log_requests = log_requests
@@ -80,6 +86,10 @@ class RequestLogger:
             self.log_requests_format = log_requests_format
         if log_requests_target is not None:
             self.log_requests_target = log_requests_target
+        if enable_log_outputs is not None:
+            self.enable_log_outputs = enable_log_outputs
+        if enable_log_deltas is not None:
+            self.enable_log_deltas = enable_log_deltas
 
         self.metadata = self._compute_metadata()
         self.targets = self._setup_targets()
@@ -205,6 +215,10 @@ class RequestLogger:
                 raise ValueError(
                     f"Invalid --log-requests-level: {self.log_requests_level=}"
                 )
+            if not self.enable_log_outputs:
+                if out_skip_names is None:
+                    out_skip_names = set()
+                out_skip_names.update({"text", "output_ids", "embedding"})
         return max_length, skip_names, out_skip_names
 
     def _log(self, msg: str) -> None:
