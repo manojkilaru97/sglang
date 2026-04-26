@@ -437,7 +437,8 @@ class ServerArgs:
     # API related
     api_key: Optional[str] = None
     admin_api_key: Optional[str] = None
-    served_model_name: Optional[str] = None
+    served_model_name: Optional[Union[str, List[str]]] = None
+    served_model_names: Optional[List[str]] = None
     weight_version: str = "default"
     chat_template: Optional[str] = None
     hf_chat_template_name: Optional[str] = None
@@ -1042,6 +1043,11 @@ class ServerArgs:
             self.tokenizer_path = self.model_path
         if self.served_model_name is None:
             self.served_model_name = self.model_path
+        if isinstance(self.served_model_name, list):
+            self.served_model_names = list(dict.fromkeys(self.served_model_name))
+            self.served_model_name = self.served_model_names[0]
+        else:
+            self.served_model_names = [self.served_model_name]
         if self.device is None:
             self.device = get_device()
         # strip device index from user if any (e.g. "cuda:0" -> "cuda")
@@ -4883,8 +4889,12 @@ class ServerArgs:
         parser.add_argument(
             "--served-model-name",
             type=str,
+            action="append",
             default=ServerArgs.served_model_name,
-            help="Override the model name returned by the v1/models endpoint in OpenAI API server.",
+            help=(
+                "Override the model name returned by the v1/models endpoint in OpenAI API server. "
+                "Can be specified multiple times to allow multiple served model aliases."
+            ),
         )
         parser.add_argument(
             "--weight-version",
@@ -6600,13 +6610,14 @@ class ServerArgs:
             None,
         }, "moe_dense_tp_size only support 1 and None currently"
 
-        # Check served model name to not have colon as it is reserved for LoRA adapter syntax
-        if not is_runai_obj_uri(self.served_model_name):
-            assert ":" not in self.served_model_name, (
-                "served_model_name cannot contain a colon (':') character. "
-                "The colon is reserved for the 'model:adapter' syntax used in LoRA adapter specification. "
-                f"Invalid value: '{self.served_model_name}'"
-            )
+        # Check served model names to not have colon as it is reserved for LoRA adapter syntax
+        for served_model_name in self.served_model_names:
+            if not is_runai_obj_uri(served_model_name):
+                assert ":" not in served_model_name, (
+                    "served_model_name cannot contain a colon (':') character. "
+                    "The colon is reserved for the 'model:adapter' syntax used in LoRA adapter specification. "
+                    f"Invalid value: '{served_model_name}'"
+                )
 
         # Check LoRA
         self.check_lora_server_args()

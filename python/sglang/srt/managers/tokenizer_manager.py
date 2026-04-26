@@ -268,6 +268,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Read model args
         self.model_path = server_args.model_path
         self.served_model_name = server_args.served_model_name
+        self.served_model_names = server_args.served_model_names
         self.model_config = model_config_class.from_server_args(server_args)
         self.is_generation = self.model_config.is_generation
         self.context_len = self.model_config.context_len

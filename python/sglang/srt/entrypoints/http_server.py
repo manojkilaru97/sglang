@@ -1542,6 +1542,11 @@ async def openai_v1_chat_completions(
     served_model_name = (
         raw_request.app.state.openai_serving_chat.tokenizer_manager.served_model_name
     )
+    served_model_names = getattr(
+        raw_request.app.state.openai_serving_chat.tokenizer_manager,
+        "served_model_names",
+        [served_model_name],
+    )
     if not request.model:
         request = request.model_copy(update={"model": served_model_name})
 
@@ -1559,7 +1564,7 @@ async def openai_v1_chat_completions(
     log_event("openai.request", request_log_attributes(rid, payload, header_dict))
     record_request_metrics(payload)
 
-    if request.model != served_model_name:
+    if request.model not in served_model_names:
         response_payload = {
             "error": {
                 "message": f"Model {request.model!r} is not served.",
@@ -1761,7 +1766,11 @@ async def openai_v1_audio_transcriptions(
 @app.get("/v1/models", response_class=ORJSONResponse)
 async def available_models():
     """Show available models. OpenAI-compatible endpoint."""
-    served_model_names = [_global_state.tokenizer_manager.served_model_name]
+    served_model_names = getattr(
+        _global_state.tokenizer_manager,
+        "served_model_names",
+        [_global_state.tokenizer_manager.served_model_name],
+    )
     model_cards = []
 
     # Add base model
@@ -1793,7 +1802,11 @@ async def available_models():
 @app.get("/v1/models/{model:path}", response_class=ORJSONResponse)
 async def retrieve_model(model: str):
     """Retrieves a model instance, providing basic information about the model."""
-    served_model_names = [_global_state.tokenizer_manager.served_model_name]
+    served_model_names = getattr(
+        _global_state.tokenizer_manager,
+        "served_model_names",
+        [_global_state.tokenizer_manager.served_model_name],
+    )
 
     if model not in served_model_names:
         return ORJSONResponse(
