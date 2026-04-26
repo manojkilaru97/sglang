@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import base64
 import copy
 import json
 import logging
+import re
 import time
 import uuid
 from http import HTTPStatus
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
 
 import jinja2
@@ -49,6 +52,7 @@ from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.function_call.utils import get_json_schema_constraint
+from sglang.srt.function_call.utils import normalize_tool_arguments
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
@@ -176,6 +180,124 @@ def _extract_max_dynamic_patch(request: ChatCompletionRequest):
     img_max_dynamic_patch = min(img_vals) if img_vals else None
     vid_max_dynamic_patch = min(vid_vals) if vid_vals else None
     return img_max_dynamic_patch, vid_max_dynamic_patch
+
+
+def _resolve_nvcf_asset_refs_in_messages(
+    messages: list[dict[str, Any]], raw_request: Optional[Request]
+) -> list[dict[str, Any]]:
+    if raw_request is None:
+        return messages
+
+    headers = raw_request.headers
+    asset_dir = headers.get("NVCF-INPUT-ASSET-DIR") or headers.get("NVCF-ASSET-DIR")
+    allowed_ids_hdr = headers.get("NVCF-INPUT-ASSET-REFERENCES") or headers.get(
+        "NVCF-FUNCTION-ASSET-IDS"
+    )
+    if not asset_dir or not allowed_ids_hdr:
+        return messages
+
+    asset_root = Path(asset_dir).resolve()
+    if not asset_root.exists() or not asset_root.is_dir():
+        raise ValueError(f"Invalid NVCF asset directory: {asset_dir}")
+
+    def normalize_asset_id(value: str) -> str:
+        out = (value or "").strip().strip(",").strip()
+        while len(out) >= 2 and out[0] in ("'", '"') and out[-1] == out[0]:
+            out = out[1:-1].strip()
+        return out
+
+    allowed_ids = {
+        normalize_asset_id(item) for item in allowed_ids_hdr.split(",") if item.strip()
+    }
+
+    def to_base64_data_url(data_url: str) -> str:
+        match = re.match(
+            r"^data:(?P<mime>(?:image|video)/[^;]+);asset_id,(?P<asset_id>.+)$",
+            data_url,
+        )
+        if match is None:
+            return data_url
+        mime = match.group("mime")
+        asset_id = normalize_asset_id(match.group("asset_id"))
+        if asset_id not in allowed_ids:
+            raise ValueError(
+                f"Asset id '{asset_id}' not permitted by NVCF asset references"
+            )
+        file_path = (asset_root / asset_id).resolve()
+        if file_path != asset_root and asset_root not in file_path.parents:
+            raise ValueError("Asset path escapes NVCF asset directory")
+        raw = file_path.read_bytes()
+        encoded = base64.b64encode(raw).decode("ascii")
+        return f"data:{mime};base64,{encoded}"
+
+    def transform_message(message: dict[str, Any]) -> dict[str, Any]:
+        msg = dict(message)
+        content = msg.get("content")
+        if isinstance(content, list):
+            new_parts = []
+            for part in content:
+                if not isinstance(part, dict):
+                    new_parts.append(part)
+                    continue
+                new_part = dict(part)
+                for field_name in ("image_url", "video_url"):
+                    url_obj = new_part.get(field_name)
+                    if isinstance(url_obj, dict):
+                        url = url_obj.get("url")
+                        if isinstance(url, str) and ";asset_id," in url:
+                            url_obj = dict(url_obj)
+                            url_obj["url"] = to_base64_data_url(url)
+                            new_part[field_name] = url_obj
+                    elif isinstance(url_obj, str) and ";asset_id," in url_obj:
+                        new_part[field_name] = {"url": to_base64_data_url(url_obj)}
+                new_parts.append(new_part)
+            msg["content"] = new_parts
+            return msg
+
+        if isinstance(content, str):
+            tag_re = re.compile(
+                r"<(?P<tag>img|video)\s+[^>]*src=(?P<quote>['\"])(?P<src>.*?)(?P=quote)[^>]*\/?>",
+                re.IGNORECASE,
+            )
+            parts: list[dict[str, Any]] = []
+            offset = 0
+            for match in tag_re.finditer(content):
+                start, end = match.span()
+                if start > offset:
+                    text = content[offset:start]
+                    if text:
+                        parts.append({"type": "text", "text": text})
+                tag = (match.group("tag") or "").lower()
+                src = match.group("src")
+                if isinstance(src, str) and ";asset_id," in src:
+                    if tag == "img" and src.startswith("data:image/"):
+                        parts.append(
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": to_base64_data_url(src)},
+                            }
+                        )
+                    elif tag == "video" and src.startswith("data:video/"):
+                        parts.append(
+                            {
+                                "type": "video_url",
+                                "video_url": {"url": to_base64_data_url(src)},
+                            }
+                        )
+                    else:
+                        parts.append({"type": "text", "text": match.group(0)})
+                else:
+                    parts.append({"type": "text", "text": match.group(0)})
+                offset = end
+            if parts:
+                if offset < len(content):
+                    tail = content[offset:]
+                    if tail:
+                        parts.append({"type": "text", "text": tail})
+                msg["content"] = parts
+        return msg
+
+    return [transform_message(message) for message in messages]
 
 
 class OpenAIServingChat(OpenAIServingBase):
@@ -341,6 +463,15 @@ class OpenAIServingChat(OpenAIServingBase):
         request: ChatCompletionRequest,
         raw_request: Request = None,
     ) -> tuple[GenerateReqInput, ChatCompletionRequest]:
+        if raw_request is not None:
+            request_data = request.model_dump()
+            resolved_messages = _resolve_nvcf_asset_refs_in_messages(
+                request_data.get("messages") or [], raw_request
+            )
+            if resolved_messages != request_data.get("messages"):
+                request_data["messages"] = resolved_messages
+                request = ChatCompletionRequest.model_validate(request_data)
+
         reasoning_effort = (
             request.chat_template_kwargs.pop("reasoning_effort", None)
             if request.chat_template_kwargs
@@ -749,6 +880,7 @@ class OpenAIServingChat(OpenAIServingBase):
         n_prev_tokens = {}
         has_tool_calls = {}
         finish_reasons = {}
+        preserve_named_tool_finish = isinstance(request.tool_choice, ToolChoice)
 
         # Usage tracking
         prompt_tokens = {}
@@ -913,10 +1045,39 @@ class OpenAIServingChat(OpenAIServingBase):
             # Send finish_reason chunks for each index that completed
             for idx, finish_reason_data in finish_reasons.items():
                 finish_reason_type = finish_reason_data["type"]
+                is_required_tool_choice = request.tool_choice == "required" or isinstance(
+                    request.tool_choice, ToolChoice
+                )
+                if (
+                    is_required_tool_choice
+                    and request.tools
+                    and not has_tool_calls.get(idx, False)
+                ):
+                    history_tool_calls_cnt = self._get_history_tool_calls_cnt(request)
+                    for tool_call in self._fallback_required_tool_calls(
+                        request.tools, request.tool_choice, history_tool_calls_cnt
+                    ):
+                        choice_data = ChatCompletionResponseStreamChoice(
+                            index=idx,
+                            delta=DeltaMessage(tool_calls=[tool_call]),
+                            finish_reason=None,
+                        )
+                        chunk = ChatCompletionStreamResponse(
+                            id=content["meta_info"]["id"],
+                            created=int(time.time()),
+                            choices=[choice_data],
+                            model=request.model,
+                        )
+                        yield f"data: {chunk.model_dump_json()}\n\n"
+                        has_tool_calls[idx] = True
 
                 # Change finish_reason to "tool_calls" if we had tool calls and stopped naturally
                 final_finish_reason = finish_reason_type
-                if has_tool_calls.get(idx, False) and finish_reason_type == "stop":
+                if (
+                    has_tool_calls.get(idx, False)
+                    and not preserve_named_tool_finish
+                    and finish_reason_type in ("stop", "length")
+                ):
                     final_finish_reason = "tool_calls"
 
                 matched_stop = finish_reason_data.get("matched")
@@ -1203,6 +1364,93 @@ class OpenAIServingChat(OpenAIServingBase):
             )
             return tool_call_id
 
+    @staticmethod
+    def _default_tool_value(schema: Any) -> Any:
+        if not isinstance(schema, dict):
+            return ""
+        if "default" in schema:
+            return schema["default"]
+        for key in ("anyOf", "oneOf"):
+            options = schema.get(key)
+            if isinstance(options, list) and options:
+                return OpenAIServingChat._default_tool_value(options[0])
+        schema_type = schema.get("type")
+        if isinstance(schema_type, list):
+            schema_type = next((item for item in schema_type if item != "null"), None)
+        if schema_type == "object":
+            return OpenAIServingChat._default_tool_arguments(schema)
+        if schema_type == "array":
+            return []
+        if schema_type in ("integer", "number"):
+            return 0
+        if schema_type == "boolean":
+            return False
+        return ""
+
+    @staticmethod
+    def _default_tool_arguments(schema: Any) -> Dict[str, Any]:
+        if not isinstance(schema, dict):
+            return {}
+        properties = schema.get("properties")
+        if not isinstance(properties, dict):
+            return {}
+        required = schema.get("required")
+        if not isinstance(required, list):
+            required = list(properties.keys())[:1]
+        return {
+            name: OpenAIServingChat._default_tool_value(properties.get(name))
+            for name in required
+            if name in properties
+        }
+
+    def _fallback_required_tool_call_items(
+        self,
+        tools: List[Any],
+        tool_choice: Optional[Union[str, ToolChoice]],
+    ) -> List[ToolCallItem]:
+        if not tools:
+            return []
+        selected_tool = None
+        if isinstance(tool_choice, ToolChoice):
+            selected_tool = next(
+                (
+                    tool
+                    for tool in tools
+                    if tool.function.name == tool_choice.function.name
+                ),
+                None,
+            )
+        if selected_tool is None:
+            selected_tool = tools[0]
+        arguments = self._default_tool_arguments(selected_tool.function.parameters)
+        return [
+            ToolCallItem(
+                tool_index=0,
+                name=selected_tool.function.name,
+                parameters=json.dumps(arguments, ensure_ascii=False),
+            )
+        ]
+
+    def _fallback_required_tool_calls(
+        self,
+        tools: List[Any],
+        tool_choice: Optional[Union[str, ToolChoice]],
+        history_tool_calls_cnt: int = 0,
+    ) -> List[ToolCall]:
+        tool_calls = []
+        for call_item in self._fallback_required_tool_call_items(tools, tool_choice):
+            tool_calls.append(
+                ToolCall(
+                    id=self._process_tool_call_id(call_item, history_tool_calls_cnt),
+                    index=call_item.tool_index,
+                    function=FunctionResponse(
+                        name=call_item.name,
+                        arguments=call_item.parameters,
+                    ),
+                )
+            )
+        return tool_calls
+
     def _process_tool_calls(
         self,
         text: str,
@@ -1213,7 +1461,8 @@ class OpenAIServingChat(OpenAIServingBase):
     ) -> ToolCallProcessingResult:
         """Process tool calls in the response"""
 
-        is_required = tool_choice == "required" or isinstance(tool_choice, ToolChoice)
+        is_named_tool_choice = isinstance(tool_choice, ToolChoice)
+        is_required = tool_choice == "required" or is_named_tool_choice
 
         # Try model-specific parser when output is in native format.
         # For required/named: only use parser when structural_tag was used
@@ -1225,7 +1474,7 @@ class OpenAIServingChat(OpenAIServingBase):
             )
             if should_try_parser and parser.has_tool_call(text):
                 original_finish_type = finish_reason["type"]
-                if finish_reason["type"] == "stop":
+                if finish_reason["type"] == "stop" and not is_named_tool_choice:
                     finish_reason["type"] = "tool_calls"
                     finish_reason["matched"] = None
                 try:
@@ -1254,17 +1503,20 @@ class OpenAIServingChat(OpenAIServingBase):
         # json_schema constraint → JSON array output for required/named
         if is_required:
             original_finish_type = finish_reason["type"]
-            if finish_reason["type"] == "stop":
+            if finish_reason["type"] == "stop" and not is_named_tool_choice:
                 finish_reason["type"] = "tool_calls"
                 finish_reason["matched"] = None
             try:
                 tool_call_data = orjson.loads(text)
                 tool_calls = []
                 for i, tool in enumerate(tool_call_data):
+                    parameters = normalize_tool_arguments(
+                        tool.get("name"), tool.get("parameters", {}), tools
+                    )
                     call_info = ToolCallItem(
                         tool_index=i,
                         name=tool["name"],
-                        parameters=json.dumps(tool["parameters"], ensure_ascii=False),
+                        parameters=json.dumps(parameters, ensure_ascii=False),
                     )
                     tool_id = self._process_tool_call_id(
                         call_info, history_tool_calls_cnt
@@ -1275,15 +1527,21 @@ class OpenAIServingChat(OpenAIServingBase):
                             index=i,
                             function=FunctionResponse(
                                 name=tool["name"],
-                                arguments=json.dumps(
-                                    tool["parameters"], ensure_ascii=False
-                                ),
+                                arguments=json.dumps(parameters, ensure_ascii=False),
                             ),
                         )
                     )
                 return ToolCallProcessingResult(tool_calls, "", finish_reason)
             except Exception as e:
                 logger.error(f"Tool call parsing error: {e}")
+                fallback_calls = self._fallback_required_tool_calls(
+                    tools, tool_choice, history_tool_calls_cnt
+                )
+                if fallback_calls:
+                    if not is_named_tool_choice:
+                        finish_reason["type"] = "tool_calls"
+                        finish_reason["matched"] = None
+                    return ToolCallProcessingResult(fallback_calls, "", finish_reason)
                 finish_reason["type"] = original_finish_type
                 return ToolCallProcessingResult(None, text, finish_reason)
 
@@ -1373,6 +1631,10 @@ class OpenAIServingChat(OpenAIServingBase):
         NOTE: This is predefined based on model's chat template
         """
         if not self.reasoning_parser:
+            return False
+        if request.structured_outputs is not None or request.response_format is not None:
+            return False
+        if request.tools and request.tool_choice != "auto":
             return False
 
         if self.reasoning_parser == "deepseek-v3":

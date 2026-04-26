@@ -9,6 +9,7 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
+from sglang.srt.function_call.utils import normalize_tool_arguments
 
 logger = logging.getLogger(__name__)
 
@@ -286,11 +287,13 @@ class Gemma4Detector(BaseFormatDetector):
                 return StreamingParseResult(normal_text=text)
 
             tool_indices = self._get_tool_indices(tools)
-            for func_name, args_str in matches:
-                arguments = _parse_gemma4_args(args_str)
+            for call_index, (func_name, args_str) in enumerate(matches):
+                arguments = normalize_tool_arguments(
+                    func_name, _parse_gemma4_args(args_str), tools
+                )
                 calls.append(
                     ToolCallItem(
-                        tool_index=tool_indices.get(func_name, -1),
+                        tool_index=call_index if func_name in tool_indices else -1,
                         name=func_name,
                         parameters=json.dumps(arguments, ensure_ascii=False),
                     )
@@ -377,8 +380,10 @@ class Gemma4Detector(BaseFormatDetector):
 
                                 calls.append(
                                     ToolCallItem(
-                                        tool_index=self._tool_indices.get(
-                                            func_name, -1
+                                        tool_index=(
+                                            self.current_tool_id
+                                            if func_name in self._tool_indices
+                                            else -1
                                         ),
                                         name=func_name,
                                         parameters="",
@@ -404,12 +409,19 @@ class Gemma4Detector(BaseFormatDetector):
                         match_idx = _find_matching_brace(current_slice)
                         if match_idx != -1:
                             args_str = current_slice[:match_idx]
-                            arguments = _parse_gemma4_args(args_str)
+                            arguments = normalize_tool_arguments(
+                                self.current_func_name,
+                                _parse_gemma4_args(args_str),
+                                tools,
+                            )
 
                             calls.append(
                                 ToolCallItem(
-                                    tool_index=self._tool_indices.get(
-                                        self.current_func_name, -1
+                                    tool_index=(
+                                        self.current_tool_id
+                                        if self.current_func_name
+                                        in self._tool_indices
+                                        else -1
                                     ),
                                     parameters=json.dumps(
                                         arguments, ensure_ascii=False

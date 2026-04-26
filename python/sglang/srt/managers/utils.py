@@ -137,7 +137,14 @@ def validate_input_length(
                 "the max context length. Truncated. "
                 f"{len(req.origin_input_ids)=}, {max_req_input_len=}."
             )
-            req.origin_input_ids = req.origin_input_ids[:max_req_input_len]
+            # Chat/tool prompts keep declarations and system guidance near the
+            # beginning, while the latest user turn is at the end. Preserve both
+            # sides instead of dropping the live turn.
+            head_len = max_req_input_len // 2
+            tail_len = max_req_input_len - head_len
+            req.origin_input_ids = (
+                req.origin_input_ids[:head_len] + req.origin_input_ids[-tail_len:]
+            )
             return None
         else:
             error_msg = (

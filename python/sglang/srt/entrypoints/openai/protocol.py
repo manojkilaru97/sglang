@@ -14,6 +14,7 @@
 """Pydantic models for OpenAI API protocol"""
 
 import logging
+import os
 import time
 import uuid
 from dataclasses import dataclass
@@ -48,6 +49,11 @@ from sglang.utils import convert_json_schema_to_str
 logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL_NAME = "default"
+TRUE_ENV_VALUES = {"1", "true", "yes", "y", "on"}
+
+
+def _env_flag_enabled(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in TRUE_ENV_VALUES
 
 
 class ModelCard(BaseModel):
@@ -617,10 +623,10 @@ class ChatCompletionRequest(BaseModel):
     return_hidden_states: bool = False
     return_routed_experts: bool = False
     return_cached_tokens_details: bool = False
-    reasoning_effort: Optional[Literal["none", "low", "medium", "high"]] = Field(
+    reasoning_effort: Optional[Literal["none", "low", "medium", "high", "max"]] = Field(
         default=None,
         description="Constrains effort on reasoning for reasoning models. "
-        "'none' disables reasoning entirely, 'low' is the least effort, 'high' is the most effort. "
+        "'none' disables reasoning entirely, 'low' is the least effort, 'max' is the most effort. "
         "Reducing reasoning effort can result in faster responses and fewer tokens used on reasoning "
         "in a response. 'none' defaults thinking and enable_thinking to false in "
         "chat_template_kwargs (unless explicitly overridden). Not supported in the harmony path.",
@@ -630,6 +636,7 @@ class ChatCompletionRequest(BaseModel):
     top_k: Optional[int] = None
     min_p: Optional[float] = None
     min_tokens: int = 0
+    structured_outputs: Optional[Dict[str, Any]] = None
     regex: Optional[str] = None
     ebnf: Optional[str] = None
     repetition_penalty: Optional[float] = None
@@ -643,6 +650,17 @@ class ChatCompletionRequest(BaseModel):
     session_params: Optional[Dict] = None
     separate_reasoning: bool = True
     stream_reasoning: bool = True
+
+    @field_validator("top_logprobs")
+    @classmethod
+    def validate_top_logprobs(cls, value):
+        if value is None:
+            return value
+        if value < 0:
+            raise ValueError("top_logprobs must be non-negative")
+        if value > 20:
+            raise ValueError("top_logprobs must be at most 20")
+        return value
     chat_template_kwargs: Optional[Dict] = None
 
     # SGLang multimodal tiling controls (extensions)
@@ -705,7 +723,7 @@ class ChatCompletionRequest(BaseModel):
 
         if r is not None and isinstance(r, dict):
             effort = r.get("effort") or r.get("reasoning_effort")
-            if effort in {"none", "low", "medium", "high"}:
+            if effort in {"none", "low", "medium", "high", "max"}:
                 values["reasoning_effort"] = effort
 
             enabled = (
@@ -721,6 +739,14 @@ class ChatCompletionRequest(BaseModel):
                     ctk = {}
                 ctk.setdefault("thinking", True)
                 values["chat_template_kwargs"] = ctk
+
+        if _env_flag_enabled("SGLANG_DEFAULT_THINKING_OFF"):
+            ctk = values.get("chat_template_kwargs")
+            if not isinstance(ctk, dict):
+                ctk = {}
+            ctk.setdefault("thinking", False)
+            ctk.setdefault("enable_thinking", False)
+            values["chat_template_kwargs"] = ctk
 
         if values.get("reasoning_effort") == "none":
             ctk = values.get("chat_template_kwargs")
@@ -793,9 +819,19 @@ class ChatCompletionRequest(BaseModel):
             else self.chat_template_kwargs.get("spaces_between_special_tokens", True)
         )
 
+        max_new_tokens = self.max_completion_tokens or self.max_tokens
+        max_output_len = os.getenv("DYN_MAX_OUTPUT_LEN") or os.getenv(
+            "SGL_MAX_OUTPUT_LEN"
+        )
+        if max_output_len:
+            try:
+                max_new_tokens = min(max_new_tokens, int(max_output_len))
+            except (TypeError, ValueError):
+                pass
+
         sampling_params = {
             "temperature": get_param("temperature"),
-            "max_new_tokens": self.max_completion_tokens or self.max_tokens,
+            "max_new_tokens": max_new_tokens,
             "min_new_tokens": self.min_tokens,
             "stop": stop,
             "stop_token_ids": self.stop_token_ids,
@@ -829,6 +865,25 @@ class ChatCompletionRequest(BaseModel):
                 self.response_format.model_dump(by_alias=True)
             )
 
+        if self.structured_outputs:
+            structured_outputs = self.structured_outputs
+            if structured_outputs.get("choice") is not None:
+                choices = [
+                    str(choice).replace("\\", "\\\\").replace("|", "\\|")
+                    for choice in structured_outputs["choice"]
+                ]
+                sampling_params["regex"] = "(" + "|".join(choices) + ")"
+            elif structured_outputs.get("regex") is not None:
+                sampling_params["regex"] = structured_outputs["regex"]
+            elif structured_outputs.get("grammar") is not None:
+                sampling_params["ebnf"] = structured_outputs["grammar"]
+            elif structured_outputs.get("json") is not None:
+                sampling_params["json_schema"] = convert_json_schema_to_str(
+                    structured_outputs["json"]
+                )
+            elif structured_outputs.get("json_object"):
+                sampling_params["json_schema"] = '{"type": "object"}'
+
         # Check if there are already existing output constraints
         has_existing_constraints = (
             sampling_params.get("regex")
@@ -860,6 +915,14 @@ class ChatMessage(BaseModel):
     content: Optional[str] = None
     reasoning_content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        for field in ("role", "content", "reasoning_content", "tool_calls"):
+            if getattr(self, field) is None:
+                data.pop(field, None)
+        return data
 
 
 class ChatCompletionResponseChoice(BaseModel):
@@ -910,8 +973,15 @@ class DeltaMessage(BaseModel):
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
-        if self.hidden_states is None:
-            data.pop("hidden_states", None)
+        for field in (
+            "role",
+            "content",
+            "reasoning_content",
+            "tool_calls",
+            "hidden_states",
+        ):
+            if getattr(self, field) is None:
+                data.pop(field, None)
         return data
 
 

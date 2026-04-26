@@ -2641,7 +2641,21 @@ class Scheduler(
                 self.tree_cache.ready_to_load_host_cache()
             )
 
-        new_batch.prepare_for_extend()
+        try:
+            new_batch.prepare_for_extend()
+        except RuntimeError as e:
+            error_msg = (
+                "Prefill KV allocation failed after request admission. "
+                "Aborting the admitted prefill batch to keep the scheduler alive."
+            )
+            logger.warning("%s error=%s", error_msg, e)
+            self._abort_failed_prefill_batch(can_run_list, error_msg)
+            if self.chunked_req in can_run_set:
+                self.chunked_req = None
+            self.running_batch.batch_is_full = False
+            self.adder = None
+            self.can_run_list = []
+            return None
 
         # Record prefill stats for logging after forward.
         new_batch.prefill_stats = PrefillStats.from_adder(
@@ -2678,6 +2692,23 @@ class Scheduler(
             new_batch.decoding_reqs = None
 
         return new_batch
+
+    def _abort_failed_prefill_batch(self, reqs: List[Req], message: str):
+        finish_reason = FINISH_ABORT(
+            message,
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+        )
+        for req in reqs:
+            req.to_finish = finish_reason
+            if req.req_pool_idx is not None:
+                release_kv_cache(req, self.tree_cache, is_insert=False)
+            self.send_to_tokenizer.send_output(
+                AbortReq(
+                    finished_reason=finish_reason.to_json(),
+                    rid=req.rid,
+                ),
+                req,
+            )
 
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
         """Update the current running decoding batch."""

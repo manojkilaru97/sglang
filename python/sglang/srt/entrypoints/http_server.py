@@ -174,6 +174,23 @@ from sglang.srt.utils.json_response import (
     dumps_json,
     orjson_response,
 )
+from sglang.srt.utils.nim_otel_compat import (
+    count_modal_inputs,
+    ensure_request_metric_names,
+    export_startup_metrics,
+    headers_to_dict,
+    log_event,
+    normalize_response_payload,
+    record_request_metrics,
+    record_response_metrics,
+    request_id_from,
+    request_log_attributes,
+    response_log_attributes,
+    response_payload_to_dict,
+    start_prometheus_scrape_export_from_env,
+    streaming_chunks_to_payload,
+    validate_chat_payload,
+)
 from sglang.srt.utils.watchdog import SubprocessWatchdog
 from sglang.utils import get_exception_traceback
 from sglang.version import __version__
@@ -303,6 +320,9 @@ async def lifespan(fast_api_app: FastAPI):
     if server_args.enable_metrics:
         add_prometheus_middleware(app)
         enable_func_timer()
+        ensure_request_metric_names()
+        export_startup_metrics()
+        start_prometheus_scrape_export_from_env()
 
     # Init tracing
     if server_args.enable_trace:
@@ -471,6 +491,33 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
             "code": HTTPStatus.BAD_REQUEST.value,
         }
         return ORJSONResponse(status_code=400, content={"error": nested_error})
+
+    if request.url.path == "/v1/chat/completions":
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = {}
+        header_dict = headers_to_dict(request.headers)
+        rid = request_id_from(header_dict, payload if isinstance(payload, dict) else {})
+        if (
+            isinstance(payload, dict)
+            and isinstance(payload.get("tool_choice"), str)
+            and payload.get("tool_choice") not in {"auto", "required", "none"}
+        ):
+            message = f"Invalid value for `tool_choice`: {payload['tool_choice']}"
+        response_payload = {
+            "error": {
+                "message": message,
+                "type": HTTPStatus.BAD_REQUEST.phrase,
+                "code": 400,
+            }
+        }
+        if isinstance(payload, dict):
+            log_event("openai.request", request_log_attributes(rid, payload, header_dict))
+            record_request_metrics(payload)
+        log_event("openai.response", response_log_attributes(rid, response_payload))
+        record_response_metrics(response_payload)
+        return ORJSONResponse(status_code=400, content=response_payload)
 
     err = ErrorResponse(
         message=message,
@@ -1492,9 +1539,123 @@ async def openai_v1_chat_completions(
     request: ChatCompletionRequest, raw_request: Request
 ):
     """OpenAI-compatible chat completion endpoint."""
-    return await raw_request.app.state.openai_serving_chat.handle_request(
+    served_model_name = (
+        raw_request.app.state.openai_serving_chat.tokenizer_manager.served_model_name
+    )
+    if not request.model:
+        request = request.model_copy(update={"model": served_model_name})
+
+    try:
+        payload = await raw_request.json()
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    if not payload.get("model"):
+        payload["model"] = served_model_name
+
+    header_dict = headers_to_dict(raw_request.headers)
+    rid = request_id_from(header_dict, payload)
+    log_event("openai.request", request_log_attributes(rid, payload, header_dict))
+    record_request_metrics(payload)
+
+    if request.model != served_model_name:
+        response_payload = {
+            "error": {
+                "message": f"Model {request.model!r} is not served.",
+                "type": "NotFound",
+                "code": 404,
+            }
+        }
+        log_event("openai.response", response_log_attributes(rid, response_payload))
+        record_response_metrics(response_payload)
+        return ORJSONResponse(response_payload, status_code=404)
+
+    image_count = count_modal_inputs(payload.get("messages"), "image_url")
+    video_count = count_modal_inputs(payload.get("messages"), "video_url")
+    audio_count = count_modal_inputs(payload.get("messages"), "input_audio") + count_modal_inputs(
+        payload.get("messages"), "audio_url"
+    )
+    media_count = image_count + video_count + audio_count
+    model_config = raw_request.app.state.openai_serving_chat.tokenizer_manager.model_config
+    if media_count and not model_config.is_multimodal:
+        response_payload = {
+            "error": {
+                "message": "multimodal processing is not enabled for this model",
+                "type": "BadRequest",
+                "code": 400,
+            }
+        }
+        log_event("openai.response", response_log_attributes(rid, response_payload))
+        record_response_metrics(response_payload)
+        return ORJSONResponse(response_payload, status_code=400)
+    if audio_count:
+        response_payload = {
+            "error": {
+                "message": "audio input is not supported for this model",
+                "type": "BadRequest",
+                "code": 400,
+            }
+        }
+        log_event("openai.response", response_log_attributes(rid, response_payload))
+        record_response_metrics(response_payload)
+        return ORJSONResponse(response_payload, status_code=400)
+
+    validation_error = validate_chat_payload(payload)
+    if validation_error is not None:
+        response_payload = {
+            "error": {
+                "message": validation_error,
+                "type": "BadRequest",
+                "code": 400,
+            }
+        }
+        log_event("openai.response", response_log_attributes(rid, response_payload))
+        record_response_metrics(response_payload)
+        return ORJSONResponse(response_payload, status_code=400)
+
+    response = await raw_request.app.state.openai_serving_chat.handle_request(
         request, raw_request
     )
+    if isinstance(response, StreamingResponse):
+        original_iterator = response.body_iterator
+
+        async def wrapped_iterator():
+            chunks = []
+            async for chunk in original_iterator:
+                chunks.append(chunk)
+                yield chunk
+            response_payload = streaming_chunks_to_payload(chunks, rid)
+            log_event("openai.response", response_log_attributes(rid, response_payload))
+            record_response_metrics(response_payload)
+
+        response.body_iterator = wrapped_iterator()
+        return response
+
+    response_payload = response_payload_to_dict(response)
+    status_code = getattr(response, "status_code", 200)
+    if (
+        isinstance(response_payload, dict)
+        and status_code >= 400
+        and "error" not in response_payload
+        and response_payload.get("message")
+    ):
+        response_payload = {
+            "error": {
+                "message": response_payload.get("message"),
+                "type": response_payload.get("type") or "BadRequest",
+                "param": response_payload.get("param"),
+                "code": response_payload.get("code") or status_code,
+            }
+        }
+        log_event("openai.response", response_log_attributes(rid, response_payload))
+        record_response_metrics(response_payload)
+        return ORJSONResponse(content=response_payload, status_code=status_code)
+
+    response_payload = normalize_response_payload(response_payload, rid)
+    log_event("openai.response", response_log_attributes(rid, response_payload))
+    record_response_metrics(response_payload)
+    return response
 
 
 @app.post(

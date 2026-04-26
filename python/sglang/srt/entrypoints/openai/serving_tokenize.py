@@ -36,6 +36,8 @@ class OpenAIServingTokenize(OpenAIServingBase):
         try:
             tokenizer = self.tokenizer_manager.tokenizer
             max_model_len = getattr(tokenizer, "model_max_length", -1)
+            if not isinstance(max_model_len, int) or max_model_len > 2**63 - 1:
+                max_model_len = -1
 
             if isinstance(request.prompt, str):
                 token_ids = tokenizer.encode(

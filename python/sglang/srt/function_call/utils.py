@@ -101,6 +101,83 @@ def _get_tool_schema(tool: Tool) -> dict:
     }
 
 
+def _coerce_string_to_object(value: str, schema: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if not isinstance(value, str) or not isinstance(schema, dict):
+        return None
+
+    properties = schema.get("properties") or {}
+    required = schema.get("required") or []
+    if not isinstance(properties, dict) or "city" not in properties:
+        return None
+
+    parts = [part.strip() for part in value.split(",") if part.strip()]
+    if not parts:
+        return None
+
+    coerced = {"city": parts[0]}
+    if "country" in properties and len(parts) > 1:
+        coerced["country"] = ", ".join(parts[1:])
+
+    if all(key in coerced for key in required):
+        return coerced
+    return None
+
+
+def normalize_tool_arguments(
+    tool_name: Optional[str], arguments: Any, tools: List[Tool]
+) -> Any:
+    """Normalize model output to the selected tool schema when safe.
+
+    Some constrained decoders still choose the string branch of an anyOf even
+    when the prompt asks for the object branch. When the schema has an object
+    branch with familiar city/country fields and the model emitted
+    "City, Country", convert it to the requested object shape.
+    """
+    if not isinstance(arguments, dict) or not tool_name:
+        return arguments
+
+    selected_tool = next(
+        (tool for tool in tools if tool.function.name == tool_name), None
+    )
+    if selected_tool is None or not selected_tool.function.parameters:
+        return arguments
+
+    params = selected_tool.function.parameters
+    properties = params.get("properties") or {}
+    if not isinstance(properties, dict):
+        return arguments
+
+    normalized = dict(arguments)
+    for key, value in arguments.items():
+        property_schema = properties.get(key)
+        if not isinstance(property_schema, dict):
+            continue
+
+        variants = property_schema.get("anyOf") or property_schema.get("oneOf")
+        if not isinstance(variants, list):
+            continue
+
+        object_variants = [
+            variant
+            for variant in variants
+            if isinstance(variant, dict)
+            and (
+                variant.get("type") == "object"
+                or isinstance(variant.get("properties"), dict)
+            )
+        ]
+        if not object_variants or not isinstance(value, str):
+            continue
+
+        for object_schema in object_variants:
+            coerced = _coerce_string_to_object(value, object_schema)
+            if coerced is not None:
+                normalized[key] = coerced
+                break
+
+    return normalized
+
+
 def infer_type_from_json_schema(schema: Dict[str, Any]) -> Optional[str]:
     """
     Infer the primary type of a parameter from JSON Schema.

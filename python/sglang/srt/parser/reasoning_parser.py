@@ -491,16 +491,25 @@ class Gemma4Detector(BaseReasoningFormatDetector):
         force_reasoning: bool = False,
         continue_final_message: bool = False,
         previous_content: str = "",
+        force_nonempty_content: bool = False,
     ):
         super().__init__(
             "<|channel>",
             "<channel|>",
             force_reasoning=force_reasoning,
             stream_reasoning=stream_reasoning,
+            tool_start_token="<|tool_call>",
             continue_final_message=continue_final_message,
             previous_content=previous_content,
         )
         self.think_start_self_label = "thought\n"
+        self._force_nonempty_content = force_nonempty_content
+
+    def detect_and_parse(self, text: str) -> StreamingParseResult:
+        ret = super().detect_and_parse(text)
+        if self._force_nonempty_content and not ret.normal_text:
+            ret.normal_text, ret.reasoning_text = ret.reasoning_text, ret.normal_text
+        return ret
 
 
 class ReasoningParser:

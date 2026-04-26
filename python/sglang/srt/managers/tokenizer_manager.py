@@ -25,7 +25,7 @@ import socket
 import sys
 import threading
 from collections import deque
-from contextlib import nullcontext
+from contextlib import nullcontext, suppress
 from datetime import datetime
 from enum import Enum
 from http import HTTPStatus
@@ -113,6 +113,7 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_tokenizer_from_processor,
 )
 from sglang.srt.utils.network import get_zmq_socket
+from sglang.srt.utils.nim_otel_compat import increment_metric
 from sglang.srt.utils.request_logger import RequestLogger
 from sglang.srt.utils.watchdog import Watchdog
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
@@ -120,6 +121,9 @@ from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
+_DISCONNECT_ABORT_POLL_INTERVAL = float(
+    os.getenv("SGLANG_DISCONNECT_ABORT_POLL_INTERVAL", "0.25")
+)
 
 logger = logging.getLogger(__name__)
 
@@ -535,21 +539,28 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Log the request
         self.request_logger.log_received_request(obj, self.tokenizer, request)
 
-        async with self.is_pause_cond:
-            await self.is_pause_cond.wait_for(lambda: not self.is_pause)
+        disconnect_abort_task = self._create_disconnect_abort_task(obj, request)
+        try:
+            async with self.is_pause_cond:
+                await self.is_pause_cond.wait_for(lambda: not self.is_pause)
 
-        async with self.model_update_lock.reader_lock:
-            await self._validate_and_resolve_lora(obj)
+            async with self.model_update_lock.reader_lock:
+                await self._validate_and_resolve_lora(obj)
 
-            # Tokenize the request and send it to the scheduler
-            if obj.is_single:
-                tokenized_obj = await self._tokenize_one_request(obj)
-                self._send_one_request(tokenized_obj)
-                async for response in self._wait_one_response(obj, request):
-                    yield response
-            else:
-                async for response in self._handle_batch_request(obj, request):
-                    yield response
+                # Tokenize the request and send it to the scheduler
+                if obj.is_single:
+                    tokenized_obj = await self._tokenize_one_request(obj)
+                    self._send_one_request(tokenized_obj)
+                    async for response in self._wait_one_response(obj, request):
+                        yield response
+                else:
+                    async for response in self._handle_batch_request(obj, request):
+                        yield response
+        finally:
+            if disconnect_abort_task is not None:
+                disconnect_abort_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await disconnect_abort_task
 
     def _detect_input_format(
         self, texts: Union[str, List[str]], is_cross_encoder: bool
@@ -1468,6 +1479,40 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self.metrics_collector.observe_one_aborted_request(
                 self.metrics_collector.labels
             )
+            increment_metric("num_aborted_requests")
+
+    def _create_disconnect_abort_task(
+        self,
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
+        request: Optional[fastapi.Request],
+    ) -> Optional[asyncio.Task]:
+        if (
+            request is None
+            or getattr(obj, "background", False)
+            or getattr(obj, "stream", False)
+        ):
+            return None
+
+        async def abort_on_disconnect():
+            while True:
+                await asyncio.sleep(_DISCONNECT_ABORT_POLL_INTERVAL)
+                if not await request.is_disconnected():
+                    continue
+
+                if getattr(obj, "is_single", True):
+                    rids = [obj.rid]
+                else:
+                    rids = list(obj.rid)
+
+                logger.info(
+                    "Request is disconnected from the client side. Abort request rids=%s",
+                    rids,
+                )
+                for rid in rids:
+                    self.abort_request(rid)
+                return
+
+        return asyncio.create_task(abort_on_disconnect())
 
     async def pause_generation(self, obj: PauseGenerationReqInput):
         async with self.is_pause_cond:

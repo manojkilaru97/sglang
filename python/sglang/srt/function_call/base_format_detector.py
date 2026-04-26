@@ -18,6 +18,7 @@ from sglang.srt.function_call.utils import (
     _find_common_prefix,
     _is_complete_json,
     _partial_json_loads,
+    normalize_tool_arguments,
 )
 
 logger = logging.getLogger(__name__)
@@ -86,7 +87,11 @@ class BaseFormatDetector(ABC):
                     tool_index=tool_indices.get(name, -1),
                     name=name,
                     parameters=json.dumps(
-                        act.get("parameters") or act.get("arguments", {}),
+                        normalize_tool_arguments(
+                            name,
+                            act.get("parameters") or act.get("arguments", {}),
+                            tools,
+                        ),
                         ensure_ascii=False,
                     ),
                 )
@@ -226,6 +231,10 @@ class BaseFormatDetector(ABC):
                         "arguments" not in obj
                     ), "model generated both parameters and arguments"
                     obj["arguments"] = obj["parameters"]
+                if "arguments" in obj:
+                    obj["arguments"] = normalize_tool_arguments(
+                        obj.get("name"), obj["arguments"], tools
+                    )
 
                 current_tool_call = obj
 
