@@ -21,6 +21,15 @@ _STARTUP_METRICS = (
     "detailed_config_info",
 )
 
+_PROMETHEUS_METRIC_NAME_MAP = {
+    "sglang_prompt_tokens_total": "prompt_tokens_total",
+    "sglang_generation_tokens_total": "generation_tokens_total",
+    "sglang_num_requests_running": "num_requests_running",
+    "sglang_num_requests_waiting": "num_requests_waiting",
+    "sglang_time_to_first_token_seconds": "time_to_first_token_seconds",
+    "sglang_e2e_request_latency_seconds": "e2e_request_latency_seconds",
+}
+
 _REQUEST_COUNTERS = (
     "request_type_image",
     "request_type_video",
@@ -51,6 +60,16 @@ def _export_dir() -> Path:
         if candidate.parent.exists():
             return candidate
     return Path("/tmp/file-exporter")
+
+
+def _file_export_enabled() -> bool:
+    configured = os.getenv("NIM_OTEL_FILE_EXPORTER_DIR")
+    if configured:
+        return True
+    explicit = os.getenv("NIM_OTEL_ENABLE_FILE_EXPORTER")
+    if explicit is not None:
+        return explicit.lower() in ("1", "true", "yes", "on")
+    return _export_dir().exists()
 
 
 def _logs_path() -> Path:
@@ -96,20 +115,50 @@ def _attrs(attributes: Dict[str, Any]) -> list[Dict[str, Any]]:
     ]
 
 
+def _resource_attributes() -> Dict[str, Any]:
+    attrs = {"service.name": os.getenv("OTEL_SERVICE_NAME", "sglang")}
+    instance_id = os.getenv("OTEL_SERVICE_INSTANCE_ID")
+    if instance_id:
+        attrs["service.instance.id"] = instance_id
+    return attrs
+
+
 def _append_json_line(path: Path, payload: Dict[str, Any]) -> None:
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with _LOCK:
-            with path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(payload, separators=(",", ":")) + "\n")
-    except Exception:
+    wrote_file = False
+    if _file_export_enabled():
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with _LOCK:
+                with path.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(payload, separators=(",", ":")) + "\n")
+            wrote_file = True
+        except Exception:
+            wrote_file = False
+
+    endpoint_configured = any(
+        os.getenv(name)
+        for name in (
+            "OTEL_EXPORTER_OTLP_ENDPOINT",
+            "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+            "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+        )
+    )
+    if endpoint_configured or not wrote_file:
         _post_otlp(payload)
 
 
 def _post_otlp(payload: Dict[str, Any]) -> None:
-    endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://172.17.0.1:4318")
     signal = "metrics" if "resourceMetrics" in payload else "logs"
-    url = endpoint.rstrip("/") + f"/v1/{signal}"
+    signal_endpoint = os.getenv(f"OTEL_EXPORTER_OTLP_{signal.upper()}_ENDPOINT")
+    endpoint = signal_endpoint or os.getenv(
+        "OTEL_EXPORTER_OTLP_ENDPOINT", "http://172.17.0.1:4318"
+    )
+    endpoint = endpoint.rstrip("/")
+    url = (
+        endpoint
+        if endpoint.endswith(f"/v1/{signal}")
+        else endpoint + f"/v1/{signal}"
+    )
     try:
         data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         request = urllib.request.Request(
@@ -121,7 +170,7 @@ def _post_otlp(payload: Dict[str, Any]) -> None:
         with urllib.request.urlopen(request, timeout=2) as response:
             response.read()
     except Exception:
-        if "172.17.0.1" not in endpoint:
+        if signal_endpoint or "172.17.0.1" not in endpoint:
             return
         try:
             data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
@@ -142,7 +191,7 @@ def log_event(body: str, attributes: Dict[str, Any]) -> None:
         "resourceLogs": [
             {
                 "resource": {
-                    "attributes": _attrs({"service.name": "sglang"}),
+                    "attributes": _attrs(_resource_attributes()),
                 },
                 "scopeLogs": [
                     {
@@ -182,7 +231,7 @@ def export_metric(name: str, value: float, *, kind: str = "sum", attrs: Optional
         "resourceMetrics": [
             {
                 "resource": {
-                    "attributes": _attrs({"service.name": "sglang"}),
+                    "attributes": _attrs(_resource_attributes()),
                 },
                 "scopeMetrics": [
                     {
@@ -197,7 +246,11 @@ def export_metric(name: str, value: float, *, kind: str = "sum", attrs: Optional
 
 
 def _sanitize_prom_metric_name(name: str) -> str:
-    return name.replace(":", "_")
+    sanitized = name.replace(":", "_")
+    for source, target in _PROMETHEUS_METRIC_NAME_MAP.items():
+        if sanitized == source or sanitized.startswith(source + "_"):
+            return target + sanitized[len(source) :]
+    return sanitized
 
 
 def _scrape_prometheus_metrics(scrape_url: str) -> None:
@@ -214,6 +267,13 @@ def _scrape_prometheus_metrics(scrape_url: str) -> None:
         for sample in family.samples:
             raw_name = str(sample.name)
             name = _sanitize_prom_metric_name(raw_name)
+            if (
+                name.startswith("sglang_")
+                or name.startswith("vllm_")
+                or "sglang:" in name
+                or "vllm:" in name
+            ):
+                continue
             labels = {str(key): str(value) for key, value in (sample.labels or {}).items()}
             try:
                 value = float(sample.value or 0.0)
@@ -501,6 +561,20 @@ def record_request_metrics(payload: Dict[str, Any]) -> None:
 
 def record_response_metrics(payload: Dict[str, Any]) -> None:
     increment_metric("request_outcome")
+    if isinstance(payload.get("usage"), dict):
+        usage = payload["usage"]
+        try:
+            increment_metric("prompt_tokens", float(usage.get("prompt_tokens") or 0))
+        except Exception:
+            pass
+        try:
+            increment_metric(
+                "generation_tokens", float(usage.get("completion_tokens") or 0)
+            )
+        except Exception:
+            pass
+    if "error" not in payload:
+        increment_metric("request_success")
     finish_reason = None
     choices = payload.get("choices")
     if isinstance(choices, list) and choices:

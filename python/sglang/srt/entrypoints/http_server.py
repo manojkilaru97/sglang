@@ -461,6 +461,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
             {"rid": rid, "request_id": rid, "payload": response_payload},
         )
         record_response_metrics(response_payload)
+        return ORJSONResponse(status_code=400, content=response_payload)
 
     err = ErrorResponse(
         message=message,
@@ -1339,11 +1340,14 @@ async def openai_v1_chat_completions(
         return response
     else:
         response_payload = normalize_response_payload(response_payload_to_dict(response), rid)
+        response_payload = _wrap_openai_error_payload(response_payload)
     log_event(
         "openai.response",
         {"rid": rid, "request_id": rid, "payload": response_payload},
     )
     record_response_metrics(response_payload)
+    if getattr(response, "status_code", 200) >= 400:
+        return ORJSONResponse(response_payload, status_code=response.status_code)
     return response
 
 
@@ -1603,6 +1607,14 @@ def _create_error_response(e):
     return ORJSONResponse(
         {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
     )
+
+
+def _wrap_openai_error_payload(payload):
+    if not isinstance(payload, dict) or "error" in payload:
+        return payload
+    if payload.get("object") == "error" and payload.get("message"):
+        return {"error": payload}
+    return payload
 
 
 # Minimal 32x32 black PNG (base64, GLM4v requires at least 32x32 sized image)
