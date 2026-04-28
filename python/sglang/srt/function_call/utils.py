@@ -233,6 +233,7 @@ def get_json_schema_constraint(
         json_schema = {
             "type": "array",
             "minItems": 1,
+            "maxItems": 64,
             "items": {
                 "type": "object",
                 "anyOf": [_get_tool_schema(tool) for tool in tools],

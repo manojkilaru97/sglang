@@ -47,11 +47,15 @@ from sglang.srt.entrypoints.harmony_utils import (
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageParam,
     ChatCompletionRequest,
+    FunctionResponse,
     PromptTokenUsageInfo,
     RequestResponseMetadata,
     ResponsesRequest,
     ResponsesResponse,
+    Tool as ChatTool,
+    ToolCall,
     UsageInfo,
+    normalize_json_schema_for_openai_compat,
 )
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.tool_server import MCPToolServer, ToolServer
@@ -159,6 +163,90 @@ class OpenAIServingResponses(OpenAIServingChat):
 
     def _request_id_prefix(self) -> str:
         return "resp_"
+
+    def _responses_tools_to_chat_tools(self, request: ResponsesRequest) -> list[ChatTool]:
+        tools = []
+        for tool in request.tools or []:
+            tool_data = tool.model_dump(exclude_none=True)
+            if tool_data.get("type") != "function":
+                continue
+            function = tool_data.get("function")
+            if not isinstance(function, dict):
+                function = {
+                    "name": tool_data.get("name"),
+                    "description": tool_data.get("description"),
+                    "parameters": tool_data.get("parameters"),
+                    "strict": tool_data.get("strict", False),
+                }
+            function = {k: v for k, v in function.items() if v is not None}
+            if function.get("name"):
+                tools.append(ChatTool(type="function", function=function))
+        return tools
+
+    def _responses_reasoning_for_response(self, request: ResponsesRequest) -> Optional[dict]:
+        if not request.reasoning:
+            return None
+        effort = request.reasoning.effort
+        if effort == "none":
+            return None
+        if effort == "max":
+            effort = "high"
+        return {"effort": effort, "summary": None}
+
+    def _sanitize_response_dict_for_openai_events(
+        self, response: dict[str, Any], request: ResponsesRequest
+    ) -> dict[str, Any]:
+        if self._responses_reasoning_for_response(request) is None:
+            response.pop("reasoning", None)
+        elif isinstance(response.get("reasoning"), dict):
+            effort = response["reasoning"].get("effort")
+            if effort == "max":
+                response["reasoning"]["effort"] = "high"
+        return response
+
+    def _responses_tool_choice_to_chat_tool_choice(self, request: ResponsesRequest):
+        tool_choice = request.tool_choice
+        if isinstance(tool_choice, dict):
+            if tool_choice.get("type") == "function":
+                function = tool_choice.get("function")
+                if not isinstance(function, dict):
+                    function = {"name": tool_choice.get("name")}
+                return {"type": "function", "function": function}
+        return tool_choice
+
+    def _responses_text_to_chat_response_format(
+        self, request: ResponsesRequest
+    ) -> Optional[dict]:
+        text_format = (request.text or {}).get("format")
+        if not isinstance(text_format, dict):
+            return None
+        fmt_type = text_format.get("type")
+        if fmt_type == "json_object":
+            return {"type": "json_object"}
+        if fmt_type != "json_schema":
+            return None
+        schema = text_format.get("schema")
+        if schema is None:
+            return None
+        return {
+            "type": "json_schema",
+            "json_schema": {
+                "name": text_format.get("name") or "structured_output",
+                "description": text_format.get("description"),
+                "strict": text_format.get("strict", True),
+                "schema": normalize_json_schema_for_openai_compat(schema),
+            },
+        }
+
+    def _responses_reasoning_to_chat_kwargs(self, request: ResponsesRequest) -> dict:
+        effort = request.reasoning.effort if request.reasoning else None
+        if effort == "none":
+            return {"thinking": False}
+        if effort in ("low", "medium", "high"):
+            return {"thinking": True, "reasoning_effort": "high"}
+        if effort == "max":
+            return {"thinking": True, "reasoning_effort": "max"}
+        return {}
 
     async def create_responses(
         self,
@@ -382,6 +470,10 @@ class OpenAIServingResponses(OpenAIServingChat):
                 model=request.model,
                 messages=messages,
                 stream=request.stream,
+                tools=self._responses_tools_to_chat_tools(request),
+                tool_choice=self._responses_tool_choice_to_chat_tool_choice(request),
+                response_format=self._responses_text_to_chat_response_format(request),
+                chat_template_kwargs=self._responses_reasoning_to_chat_kwargs(request),
             )
 
             # Follow SGLang's _process_messages pattern
@@ -459,9 +551,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             final_res = context.last_output
             assert final_res is not None
 
-            output = self._make_response_output_items(
-                request, final_res["text"], tokenizer
-            )
+            output = self._make_response_output_items(request, final_res, tokenizer)
 
             # Calculate usage from actual output
             if hasattr(final_res, "meta_info"):
@@ -523,14 +613,16 @@ class OpenAIServingResponses(OpenAIServingChat):
     def _make_response_output_items(
         self,
         request: ResponsesRequest,
-        final_output: Any,
+        final_res: Any,
         tokenizer: Any,
     ):
+        final_output = final_res["text"] if isinstance(final_res, dict) else final_res
         # Handle reasoning parsing if enabled
         if self.reasoning_parser:
             # Use standard reasoning parser (openai maps to T4Detector internally)
             reasoning_parser = ReasoningParser(
-                model_type=self.reasoning_parser, stream_reasoning=False
+                model_type=self.reasoning_parser,
+                stream_reasoning=False,
             )
             reasoning_content, content = reasoning_parser.parse_non_stream(final_output)
         else:
@@ -538,6 +630,53 @@ class OpenAIServingResponses(OpenAIServingChat):
             content = final_output
 
         output_items = []
+        chat_tools = self._responses_tools_to_chat_tools(request)
+        if (
+            request.tool_choice != "none"
+            and chat_tools
+            and self.tool_call_parser
+            and content
+        ):
+            finish_reason = (
+                copy.deepcopy(final_res.get("meta_info", {}).get("finish_reason"))
+                if isinstance(final_res, dict)
+                else None
+            ) or {"type": "stop", "matched": None}
+            chat_tool_choice = self._responses_tool_choice_to_chat_tool_choice(request)
+            tool_calls, content, _ = self._process_tool_calls(
+                content,
+                chat_tools,
+                finish_reason,
+                chat_tool_choice,
+                0,
+            )
+            if not tool_calls and chat_tool_choice != "auto":
+                tool_calls, content, _ = self._process_tool_calls(
+                    content,
+                    chat_tools,
+                    finish_reason,
+                    "auto",
+                    0,
+                )
+            if tool_calls:
+                content = ""
+            for idx, tool_call in enumerate(tool_calls or []):
+                function = tool_call.function
+                arguments = function.arguments or ""
+                if not isinstance(arguments, str):
+                    arguments = json.dumps(arguments, ensure_ascii=False)
+                call_id = tool_call.id or f"call_{random_uuid()}"
+                output_items.append(
+                    ResponseFunctionToolCall(
+                        id=f"fc_{random_uuid()}",
+                        type="function_call",
+                        call_id=call_id,
+                        name=function.name or "",
+                        arguments=arguments,
+                        status="completed",
+                    )
+                )
+
         if reasoning_content:
             reasoning_item = ResponseReasoningItem(
                 id=f"rs_{random_uuid()}",
@@ -839,6 +978,13 @@ class OpenAIServingResponses(OpenAIServingChat):
                 f"data: {event.model_dump_json(indent=None)}\n\n"
             )
 
+        def _send_raw_event(event_type: str, payload: dict[str, Any]):
+            nonlocal sequence_number
+            payload.setdefault("type", event_type)
+            payload.setdefault("sequence_number", sequence_number)
+            sequence_number += 1
+            return f"event: {event_type}\n" f"data: {json.dumps(payload)}\n\n"
+
         current_content_index = 0
         current_output_index = 0
         current_item_id = f"item_{random_uuid()}"
@@ -853,6 +999,9 @@ class OpenAIServingResponses(OpenAIServingChat):
             status="in_progress",
             usage=None,
         ).model_dump()
+        initial_response = self._sanitize_response_dict_for_openai_events(
+            initial_response, request
+        )
         yield _send_event(
             openai_responses_types.ResponseCreatedEvent(
                 type="response.created",
@@ -1226,7 +1375,21 @@ class OpenAIServingResponses(OpenAIServingChat):
             created_time=created_time,
         )
         # Convert final_response to the format expected by ResponseCompletedEvent
-        response_dict = final_response.model_dump()
+        if isinstance(final_response, ORJSONResponse):
+            error_body = final_response.body.decode("utf-8")
+            yield _send_event(
+                openai_responses_types.ResponseFailedEvent(
+                    type="response.failed",
+                    sequence_number=-1,
+                    response=initial_response,
+                )
+            )
+            yield f"data: {error_body}\n\n"
+            return
+
+        response_dict = self._sanitize_response_dict_for_openai_events(
+            final_response.model_dump(), request
+        )
 
         # Convert UsageInfo to ResponseUsage format
         if response_dict.get("usage"):
@@ -1242,6 +1405,94 @@ class OpenAIServingResponses(OpenAIServingChat):
                 },
                 "total_tokens": usage_info.get("total_tokens", 0),
             }
+
+        if not self.use_harmony:
+            for output_index, item in enumerate(response_dict.get("output") or []):
+                item_id = item.get("id") or f"item_{random_uuid()}"
+                item_type = item.get("type")
+                if item_type == "message":
+                    added_item = dict(item)
+                    added_item["content"] = []
+                    yield _send_raw_event(
+                        "response.output_item.added",
+                        {"output_index": output_index, "item": added_item},
+                    )
+                    for content_index, part in enumerate(item.get("content") or []):
+                        if part.get("type") != "output_text":
+                            continue
+                        text = part.get("text") or ""
+                        empty_part = dict(part)
+                        empty_part["text"] = ""
+                        yield _send_raw_event(
+                            "response.content_part.added",
+                            {
+                                "item_id": item_id,
+                                "output_index": output_index,
+                                "content_index": content_index,
+                                "part": empty_part,
+                            },
+                        )
+                        if text:
+                            yield _send_raw_event(
+                                "response.output_text.delta",
+                                {
+                                    "item_id": item_id,
+                                    "output_index": output_index,
+                                    "content_index": content_index,
+                                    "delta": text,
+                                    "logprobs": [],
+                                },
+                            )
+                        yield _send_raw_event(
+                            "response.output_text.done",
+                            {
+                                "item_id": item_id,
+                                "output_index": output_index,
+                                "content_index": content_index,
+                                "text": text,
+                                "logprobs": [],
+                            },
+                        )
+                        yield _send_raw_event(
+                            "response.content_part.done",
+                            {
+                                "item_id": item_id,
+                                "output_index": output_index,
+                                "content_index": content_index,
+                                "part": part,
+                            },
+                        )
+                    yield _send_raw_event(
+                        "response.output_item.done",
+                        {"output_index": output_index, "item": item},
+                    )
+                elif item_type == "function_call":
+                    yield _send_raw_event(
+                        "response.output_item.added",
+                        {"output_index": output_index, "item": {**item, "arguments": ""}},
+                    )
+                    arguments = item.get("arguments") or ""
+                    if arguments:
+                        yield _send_raw_event(
+                            "response.function_call_arguments.delta",
+                            {
+                                "item_id": item_id,
+                                "output_index": output_index,
+                                "delta": arguments,
+                            },
+                        )
+                    yield _send_raw_event(
+                        "response.function_call_arguments.done",
+                        {
+                            "item_id": item_id,
+                            "output_index": output_index,
+                            "arguments": arguments,
+                        },
+                    )
+                    yield _send_raw_event(
+                        "response.output_item.done",
+                        {"output_index": output_index, "item": item},
+                    )
 
         yield _send_event(
             openai_responses_types.ResponseCompletedEvent(

@@ -1225,7 +1225,7 @@ OpenAIServingRequest = Union[
 class ResponseReasoningParam(BaseModel):
     """Reasoning parameters for responses."""
 
-    effort: Optional[Literal["low", "medium", "high"]] = Field(
+    effort: Optional[Literal["none", "low", "medium", "high", "max"]] = Field(
         default="medium",
         description="Constrains effort on reasoning for reasoning models.",
     )
@@ -1234,9 +1234,33 @@ class ResponseReasoningParam(BaseModel):
 class ResponseTool(BaseModel):
     """Tool definition for responses."""
 
-    type: Literal["web_search_preview", "code_interpreter"] = Field(
+    type: Literal["function", "web_search_preview", "code_interpreter"] = Field(
         description="Type of tool to enable"
     )
+    name: Optional[str] = None
+    description: Optional[str] = None
+    parameters: Optional[Dict[str, Any]] = None
+    strict: Optional[bool] = None
+    function: Optional[Dict[str, Any]] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def flatten_function_tool(cls, values):
+        if not isinstance(values, dict):
+            return values
+        function = values.get("function")
+        if values.get("type") == "function" and isinstance(function, dict):
+            values = dict(values)
+            for key in ("name", "description", "parameters", "strict"):
+                if values.get(key) is None and function.get(key) is not None:
+                    values[key] = function[key]
+        return values
+
+
+ResponsesToolChoice: TypeAlias = Union[
+    Literal["auto", "required", "none"],
+    Dict[str, Any],
+]
 
 
 ResponseInputOutputItem: TypeAlias = Union[
@@ -1276,7 +1300,8 @@ class ResponsesRequest(BaseModel):
     store: Optional[bool] = True
     stream: Optional[bool] = False
     temperature: Optional[float] = None
-    tool_choice: Literal["auto", "required", "none"] = "auto"
+    text: Optional[Dict[str, Any]] = None
+    tool_choice: ResponsesToolChoice = "auto"
     tools: List[ResponseTool] = Field(default_factory=list)
     top_logprobs: Optional[int] = 0
     top_p: Optional[float] = None
@@ -1353,6 +1378,17 @@ class ResponsesRequest(BaseModel):
             "repetition_penalty": self.repetition_penalty,
         }
 
+        text_format = (self.text or {}).get("format")
+        if isinstance(text_format, dict):
+            if text_format.get("type") == "json_schema":
+                schema = text_format.get("schema")
+                if schema is not None:
+                    params["json_schema"] = convert_json_schema_to_str(
+                        normalize_json_schema_for_openai_compat(schema)
+                    )
+            elif text_format.get("type") == "json_object":
+                params["json_schema"] = '{"type": "object"}'
+
         # Apply any additional default parameters
         for key, value in default_params.items():
             if key not in params or params[key] is None:
@@ -1381,7 +1417,7 @@ class ResponsesResponse(BaseModel):
     status: Literal["queued", "in_progress", "completed", "failed", "cancelled"]
     usage: Optional[UsageInfo] = None
     parallel_tool_calls: bool = True
-    tool_choice: str = "auto"
+    tool_choice: Any = "auto"
     tools: List[ResponseTool] = Field(default_factory=list)
 
     # OpenAI compatibility fields. not all are used at the moment.
