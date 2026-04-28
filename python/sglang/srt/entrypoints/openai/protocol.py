@@ -13,7 +13,9 @@
 # ==============================================================================
 """Pydantic models for OpenAI API protocol"""
 
+import copy
 import logging
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -58,6 +60,118 @@ from sglang.utils import convert_json_schema_to_str
 logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL_NAME = "default"
+JSON_SCHEMA_KEYWORDS = {
+    "$defs",
+    "$id",
+    "$schema",
+    "additionalItems",
+    "additionalProperties",
+    "allOf",
+    "anyOf",
+    "const",
+    "contains",
+    "default",
+    "definitions",
+    "description",
+    "else",
+    "enum",
+    "exclusiveMaximum",
+    "exclusiveMinimum",
+    "format",
+    "if",
+    "items",
+    "maxItems",
+    "maxLength",
+    "maximum",
+    "minItems",
+    "minLength",
+    "minimum",
+    "multipleOf",
+    "not",
+    "oneOf",
+    "pattern",
+    "patternProperties",
+    "prefixItems",
+    "properties",
+    "propertyNames",
+    "required",
+    "then",
+    "title",
+    "type",
+    "uniqueItems",
+}
+
+
+def normalize_json_schema_for_openai_compat(schema: Any) -> Any:
+    """Repair OpenAI-compatible schemas for SGLang/xgrammar constrained decoding.
+
+    Some clients send schemas that are legal JSON Schema but awkward for grammar
+    compilers, e.g. required fields omitted from `properties` or property-bag
+    objects without an explicit `properties` wrapper. Keep the original contract
+    satisfiable while adding enough shape for constrained decoding to emit the
+    expected keys.
+    """
+    schema = copy.deepcopy(schema)
+
+    def repair(node: Any) -> Any:
+        if isinstance(node, list):
+            return [repair(item) for item in node]
+        if not isinstance(node, dict):
+            return node
+
+        for key in ("oneOf", "anyOf", "allOf"):
+            if isinstance(node.get(key), list):
+                node[key] = [repair(item) for item in node[key]]
+        for key in ("items", "additionalProperties", "not", "if", "then", "else"):
+            if isinstance(node.get(key), (dict, list)):
+                node[key] = repair(node[key])
+        for key in ("$defs", "definitions"):
+            if isinstance(node.get(key), dict):
+                node[key] = {name: repair(value) for name, value in node[key].items()}
+
+        properties = node.get("properties")
+        if isinstance(properties, dict):
+            node["properties"] = {
+                name: repair(value) for name, value in properties.items()
+            }
+        else:
+            property_bag = {
+                key: value
+                for key, value in list(node.items())
+                if key not in JSON_SCHEMA_KEYWORDS and isinstance(value, dict)
+            }
+            if property_bag and (
+                node.get("type") == "object" or "required" in node or len(property_bag) > 1
+            ):
+                for key in property_bag:
+                    node.pop(key, None)
+                node.setdefault("type", "object")
+                node["properties"] = {
+                    name: repair(value) for name, value in property_bag.items()
+                }
+                properties = node["properties"]
+
+        properties = node.get("properties")
+        required = node.get("required")
+        if isinstance(properties, dict) and isinstance(required, list):
+            for name in required:
+                if isinstance(name, str) and name not in properties:
+                    properties[name] = {"type": "string", "minLength": 1}
+
+        if (
+            isinstance(properties, dict)
+            and "required" not in node
+            and len(properties) == 1
+            and any(key in node for key in ("oneOf", "anyOf", "allOf")) is False
+        ):
+            # OpenAI-style oneOf branches often omit `required`, but the desired
+            # branch key is still the whole point of the branch. Requiring the
+            # sole property avoids "{}" or unrelated branch drift.
+            node["required"] = [next(iter(properties))]
+
+        return node
+
+    return repair(schema)
 
 
 class ModelCard(BaseModel):
@@ -130,7 +244,7 @@ class JsonSchemaResponseFormat(BaseModel):
     name: str
     description: Optional[str] = None
     # use alias to workaround pydantic conflict
-    schema_: Optional[Dict[str, object]] = Field(alias="schema", default=None)
+    schema_: Optional[Any] = Field(alias="schema", default=None)
     strict: Optional[bool] = False
 
 
@@ -567,6 +681,7 @@ class ChatCompletionRequest(BaseModel):
     min_tokens: int = 0
     regex: Optional[str] = None
     ebnf: Optional[str] = None
+    json_schema: Optional[Any] = None
     repetition_penalty: Optional[float] = None
     stop_token_ids: Optional[List[int]] = None
     stop_regex: Optional[Union[str, List[str]]] = None
@@ -574,6 +689,7 @@ class ChatCompletionRequest(BaseModel):
     ignore_eos: bool = False
     continue_final_message: bool = False
     skip_special_tokens: bool = True
+    structured_outputs: Optional[Dict[str, Any]] = None
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
     session_params: Optional[Dict] = None
     separate_reasoning: bool = True
@@ -677,6 +793,43 @@ class ChatCompletionRequest(BaseModel):
 
     @model_validator(mode="before")
     @classmethod
+    def normalize_structured_outputs(cls, values: Dict):
+        structured_outputs = values.get("structured_outputs")
+        if not isinstance(structured_outputs, dict):
+            return values
+
+        has_existing_constraint = any(
+            values.get(key) is not None
+            for key in ("regex", "ebnf", "json_schema", "response_format")
+        )
+        if has_existing_constraint:
+            return values
+
+        if structured_outputs.get("regex") is not None:
+            values["regex"] = str(structured_outputs["regex"])
+        elif structured_outputs.get("grammar") is not None:
+            values["ebnf"] = str(structured_outputs["grammar"])
+        elif structured_outputs.get("ebnf") is not None:
+            values["ebnf"] = str(structured_outputs["ebnf"])
+        elif isinstance(structured_outputs.get("choice"), list):
+            choices = [
+                re.escape(str(choice))
+                for choice in structured_outputs["choice"]
+                if choice is not None
+            ]
+            if choices:
+                values["regex"] = "(?:" + "|".join(choices) + ")"
+        elif structured_outputs.get("json_object") is not None:
+            values["response_format"] = {"type": "json_object"}
+        elif structured_outputs.get("json_schema") is not None:
+            values["json_schema"] = structured_outputs["json_schema"]
+        elif structured_outputs.get("json") is not None:
+            values["json_schema"] = structured_outputs["json"]
+
+        return values
+
+    @model_validator(mode="before")
+    @classmethod
     def set_json_schema(cls, values):
         response_format = values.get("response_format")
         if not response_format:
@@ -752,13 +905,19 @@ class ChatCompletionRequest(BaseModel):
 
         if self.response_format and self.response_format.type == "json_schema":
             sampling_params["json_schema"] = convert_json_schema_to_str(
-                self.response_format.json_schema.schema_
+                normalize_json_schema_for_openai_compat(
+                    self.response_format.json_schema.schema_
+                )
             )
         elif self.response_format and self.response_format.type == "json_object":
             sampling_params["json_schema"] = '{"type": "object"}'
         elif self.response_format and self.response_format.type == "structural_tag":
             sampling_params["structural_tag"] = convert_json_schema_to_str(
                 self.response_format.model_dump(by_alias=True)
+            )
+        elif self.json_schema is not None:
+            sampling_params["json_schema"] = convert_json_schema_to_str(
+                normalize_json_schema_for_openai_compat(self.json_schema)
             )
 
         # Check if there are already existing output constraints
@@ -779,7 +938,7 @@ class ChatCompletionRequest(BaseModel):
                 )
             elif constraint_type == "json_schema":
                 sampling_params[constraint_type] = convert_json_schema_to_str(
-                    constraint_value  # type: ignore
+                    normalize_json_schema_for_openai_compat(constraint_value)  # type: ignore
                 )
             else:
                 sampling_params[constraint_type] = constraint_value

@@ -33,6 +33,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolCallProcessingResult,
     ToolChoice,
     TopLogprob,
+    normalize_json_schema_for_openai_compat,
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
@@ -418,6 +419,27 @@ class OpenAIServingChat(OpenAIServingBase):
                 messages.insert(0, {"role": "system", "content": ""})
             if request.tools:
                 messages[0]["tools"] = [tool.model_dump() for tool in request.tools]
+            if request.response_format:
+                response_format = request.response_format.model_dump(
+                    by_alias=True, exclude_none=True
+                )
+                json_schema = response_format.get("json_schema")
+                if isinstance(json_schema, dict) and "schema" in json_schema:
+                    json_schema["schema"] = normalize_json_schema_for_openai_compat(
+                        json_schema["schema"]
+                    )
+                messages[0]["response_format"] = response_format
+            elif request.json_schema is not None:
+                messages[0]["response_format"] = {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "structured_output",
+                        "strict": True,
+                        "schema": normalize_json_schema_for_openai_compat(
+                            request.json_schema
+                        ),
+                    },
+                }
 
             if self.chat_encoding_spec == "dsv4":
                 # V4 encoder only accepts "max" / "high" / None.

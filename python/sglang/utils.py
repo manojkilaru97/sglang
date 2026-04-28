@@ -50,7 +50,9 @@ def info_once(message: str):
     logger.info(message)
 
 
-def convert_json_schema_to_str(json_schema: Union[dict, str, Type[BaseModel]]) -> str:
+def convert_json_schema_to_str(
+    json_schema: Union[dict, str, bool, Type[BaseModel]]
+) -> str:
     """Convert a JSON schema to a string.
     Parameters
     ----------
@@ -65,7 +67,7 @@ def convert_json_schema_to_str(json_schema: Union[dict, str, Type[BaseModel]]) -
     ValueError
         If the schema is not a dictionary, a string or a Pydantic class.
     """
-    if isinstance(json_schema, dict):
+    if isinstance(json_schema, (dict, bool)):
         schema_str = json.dumps(json_schema)
     elif isinstance(json_schema, str):
         schema_str = json_schema
