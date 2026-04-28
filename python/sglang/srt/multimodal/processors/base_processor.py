@@ -44,6 +44,29 @@ SGL_USE_CUDA_IPC = envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get()
 _IPC_POOL_HANDLE_CACHE = envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.get()
 
 
+def _describe_mm_data_for_error(data: Any) -> str:
+    if isinstance(data, bytes):
+        return f"<bytes len={len(data)}>"
+    if isinstance(data, dict):
+        url = data.get("url")
+        if isinstance(url, str):
+            return _describe_mm_data_for_error(url)
+        data_format = data.get("format")
+        return f"<dict format={data_format!r}>"
+    url = getattr(data, "url", None)
+    if isinstance(url, str):
+        return _describe_mm_data_for_error(url)
+    if isinstance(data, str):
+        if data.startswith("data:"):
+            header = data.split(",", 1)[0]
+            return f"{header},<redacted>"
+        if data.startswith(("http://", "https://")):
+            head = data.split("?", 1)[0]
+            return head if len(head) <= 200 else f"{head[:200]}..."
+        return data if len(data) <= 200 else f"{data[:200]}..."
+    return f"<{type(data).__name__}>"
+
+
 @dataclasses.dataclass
 class BaseMultiModalProcessorOutput:
     # input_text with all multimodality placeholder token expanded
@@ -542,7 +565,10 @@ class BaseMultimodalProcessor(ABC):
                 return load_audio(data, audio_sample_rate)
 
         except Exception as e:
-            raise RuntimeError(f"Error while loading data {data}: {e}")
+            raise ValueError(
+                f"Error while loading {modality.name} data "
+                f"{_describe_mm_data_for_error(data)}: {e}"
+            ) from e
 
     def _submit_mm_data_loading_tasks_simple(
         self,
@@ -848,14 +874,21 @@ class BaseMultimodalProcessor(ABC):
             try:
                 result = future.result()
             except Exception as e:
-                logger.exception(
-                    "[load_mm_data(simple)] error loading %s data at index=%d",
+                logger.warning(
+                    "[load_mm_data(simple)] error loading %s data at index=%d: %s",
                     modality.name,
                     idx,
+                    e,
                 )
-                raise RuntimeError(
+                logger.debug(
+                    "[load_mm_data(simple)] detailed traceback for %s data at index=%d",
+                    modality.name,
+                    idx,
+                    exc_info=True,
+                )
+                raise ValueError(
                     f"An exception occurred while loading {modality.name} data at index {idx}: {e}"
-                )
+                ) from e
 
             if modality == Modality.IMAGE:
                 images[idx] = result

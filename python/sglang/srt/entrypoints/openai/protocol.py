@@ -825,7 +825,12 @@ class ChatCompletionRequest(BaseModel):
         )
         if max_output_len:
             try:
-                max_new_tokens = min(max_new_tokens, int(max_output_len))
+                max_output_len_int = int(max_output_len)
+                max_new_tokens = (
+                    max_output_len_int
+                    if max_new_tokens is None
+                    else min(max_new_tokens, max_output_len_int)
+                )
             except (TypeError, ValueError):
                 pass
 

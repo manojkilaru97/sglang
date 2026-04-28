@@ -1491,6 +1491,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             request is None
             or getattr(obj, "background", False)
             or getattr(obj, "stream", False)
+            or is_health_check_generate_req(obj)
         ):
             return None
 

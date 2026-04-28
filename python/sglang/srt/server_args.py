@@ -4896,6 +4896,7 @@ class ServerArgs:
                 "Can be specified multiple times to allow multiple served model aliases."
             ),
         )
+        parser.set_defaults(served_model_names=ServerArgs.served_model_names)
         parser.add_argument(
             "--weight-version",
             type=str,
