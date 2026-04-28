@@ -215,7 +215,7 @@ class OpenAIServingChat(OpenAIServingBase):
             tool_name = request.tool_choice.function.name
             tool_exists = any(tool.function.name == tool_name for tool in request.tools)
             if not tool_exists:
-                return f"Tool '{tool_name}' not found in tools list."
+                return f"Tool '{tool_name}' not found in the tools list."
 
         # Validate tool definitions
         for i, tool in enumerate(request.tools or []):
@@ -1303,7 +1303,10 @@ class OpenAIServingChat(OpenAIServingBase):
             normal_text, calls = parser.parse_stream_chunk(delta)
 
         # Yield normal text
-        if normal_text:
+        if normal_text and not (
+            request.tool_choice != "auto"
+            and normal_text.strip() == ""
+        ):
             choice_data = ChatCompletionResponseStreamChoice(
                 index=index,
                 delta=DeltaMessage(content=normal_text),

@@ -1479,6 +1479,11 @@ async def v1_score_request(request: ScoringRequest, raw_request: Request):
 @app.post("/v1/responses", dependencies=[Depends(validate_json_request)])
 async def v1_responses_request(request: dict, raw_request: Request):
     """Endpoint for the responses API with reasoning support."""
+    payload = request if isinstance(request, dict) else {}
+    header_dict = headers_to_dict(raw_request.headers)
+    rid = request_id_from(header_dict, payload)
+    log_event("openai.request", request_log_attributes(rid, payload, header_dict))
+    record_request_metrics(payload)
 
     request_obj = ResponsesRequest(**request)
     result = await raw_request.app.state.openai_serving_responses.create_responses(
@@ -1487,12 +1492,33 @@ async def v1_responses_request(request: dict, raw_request: Request):
 
     # Handle streaming responses
     if isinstance(result, AsyncGenerator):
+        async def wrapped_responses_iterator():
+            chunks = []
+            async for chunk in result:
+                chunks.append(chunk)
+                yield chunk
+            response_payload = streaming_chunks_to_payload(chunks, rid)
+            log_event(
+                "openai.response",
+                {"rid": rid, "request_id": rid, "payload": response_payload},
+            )
+            record_response_metrics(response_payload)
+
         return StreamingResponse(
-            result,
+            wrapped_responses_iterator(),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
         )
 
+    response_payload = response_payload_to_dict(result)
+    response_payload = _wrap_openai_error_payload(response_payload)
+    log_event(
+        "openai.response",
+        {"rid": rid, "request_id": rid, "payload": response_payload},
+    )
+    record_response_metrics(response_payload)
+    if getattr(result, "status_code", 200) >= 400:
+        return ORJSONResponse(response_payload, status_code=result.status_code)
     return result
 
 

@@ -651,6 +651,10 @@ def streaming_chunks_to_payload(chunks: Iterable[Any], rid: str) -> Dict[str, An
                 event = json.loads(line)
             except Exception:
                 continue
+            if event.get("type") == "response.completed" and isinstance(
+                event.get("response"), dict
+            ):
+                return dict(event["response"])
             if event.get("id"):
                 actual_id = event.get("id")
             if event.get("usage") is not None:
