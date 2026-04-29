@@ -1,5 +1,7 @@
 import json
 import os
+import fcntl
+import tempfile
 import threading
 import time
 import urllib.request
@@ -11,6 +13,8 @@ _COUNTERS: Dict[str, float] = {}
 _PROM_COUNTERS: Dict[str, Any] = {}
 _EXPORT_THREAD_STARTED = False
 _PROM_SCRAPE_THREAD_STARTED = False
+_PROM_SCRAPE_LOCK_HANDLE = None
+_PROCESS_START_NS = str(int(time.time() * 1_000_000_000))
 
 _STARTUP_METRICS = (
     "engine_startup_time",
@@ -22,6 +26,7 @@ _STARTUP_METRICS = (
 )
 
 _PROMETHEUS_METRIC_NAME_MAP = {
+    "sglang_http_requests_total": "http_requests_total",
     "sglang_prompt_tokens_total": "prompt_tokens_total",
     "sglang_generation_tokens_total": "generation_tokens_total",
     "sglang_num_requests_running": "num_requests_running",
@@ -212,18 +217,33 @@ def log_event(body: str, attributes: Dict[str, Any]) -> None:
     _append_json_line(_logs_path(), record)
 
 
-def _metric_point(value: float, attrs: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def _metric_point(
+    value: float,
+    attrs: Optional[Dict[str, Any]] = None,
+    *,
+    start_time_unix_nano: Optional[str] = None,
+) -> Dict[str, Any]:
     point: Dict[str, Any] = {
         "timeUnixNano": _now_ns(),
         "asDouble": float(value),
     }
+    if start_time_unix_nano is not None:
+        point["startTimeUnixNano"] = start_time_unix_nano
     if attrs:
         point["attributes"] = _attrs(attrs)
     return point
 
 
 def export_metric(name: str, value: float, *, kind: str = "sum", attrs: Optional[Dict[str, Any]] = None) -> None:
-    metric = {"name": name, kind: {"dataPoints": [_metric_point(value, attrs)]}}
+    start_time = _PROCESS_START_NS if kind == "sum" else None
+    metric = {
+        "name": name,
+        kind: {
+            "dataPoints": [
+                _metric_point(value, attrs, start_time_unix_nano=start_time)
+            ]
+        },
+    }
     if kind == "sum":
         metric[kind]["isMonotonic"] = True
         metric[kind]["aggregationTemporality"] = 2
@@ -275,6 +295,8 @@ def _scrape_prometheus_metrics(scrape_url: str) -> None:
             ):
                 continue
             labels = {str(key): str(value) for key, value in (sample.labels or {}).items()}
+            if "endpoint" in labels and "handler" not in labels:
+                labels["handler"] = labels["endpoint"]
             try:
                 value = float(sample.value or 0.0)
             except Exception:
@@ -283,6 +305,34 @@ def _scrape_prometheus_metrics(scrape_url: str) -> None:
                 export_metric(name, value, kind="gauge", attrs=labels)
             elif family_type in ("counter", "histogram", "summary"):
                 export_metric(name, value, kind="sum", attrs=labels)
+
+
+def _acquire_prometheus_scrape_lock() -> bool:
+    global _PROM_SCRAPE_LOCK_HANDLE
+    if _PROM_SCRAPE_LOCK_HANDLE is not None:
+        return True
+
+    lock_dir = Path(os.getenv("PROMETHEUS_MULTIPROC_DIR") or tempfile.gettempdir())
+    try:
+        lock_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        lock_dir = Path(tempfile.gettempdir())
+    lock_path = lock_dir / "nim_otel_prom_scrape.lock"
+    try:
+        handle = lock_path.open("w", encoding="utf-8")
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        handle.write(f"{os.getpid()}\n")
+        handle.flush()
+        _PROM_SCRAPE_LOCK_HANDLE = handle
+        return True
+    except BlockingIOError:
+        try:
+            handle.close()
+        except Exception:
+            pass
+        return False
+    except Exception:
+        return False
 
 
 def start_prometheus_scrape_export_from_env() -> None:
@@ -294,6 +344,8 @@ def start_prometheus_scrape_export_from_env() -> None:
         interval_seconds = float(os.getenv("OTEL_PROM_SCRAPE_INTERVAL", "10"))
     except Exception:
         interval_seconds = 10.0
+    if not _acquire_prometheus_scrape_lock():
+        return
     _PROM_SCRAPE_THREAD_STARTED = True
 
     def _run() -> None:
@@ -561,18 +613,6 @@ def record_request_metrics(payload: Dict[str, Any]) -> None:
 
 def record_response_metrics(payload: Dict[str, Any]) -> None:
     increment_metric("request_outcome")
-    if isinstance(payload.get("usage"), dict):
-        usage = payload["usage"]
-        try:
-            increment_metric("prompt_tokens", float(usage.get("prompt_tokens") or 0))
-        except Exception:
-            pass
-        try:
-            increment_metric(
-                "generation_tokens", float(usage.get("completion_tokens") or 0)
-            )
-        except Exception:
-            pass
     if "error" not in payload:
         increment_metric("request_success")
     finish_reason = None
