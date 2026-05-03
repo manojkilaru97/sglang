@@ -380,6 +380,89 @@ class Qwen3CoderDetector(BaseFormatDetector):
                 # Incomplete parameter tag or value
                 break
 
+            # Some guided/structural paths can strip the fixed Qwen prefix and
+            # surface only `param_name>value</parameter>...`. For a single-tool
+            # request, recover that as the sole function call instead of
+            # leaking the fragment as assistant content.
+            if (
+                not self.is_inside_tool_call
+                and self.current_func_name is None
+                and tools
+                and len(tools) == 1
+                and not current_slice.startswith("<")
+            ):
+                leading_ws = len(current_slice) - len(current_slice.lstrip())
+                stripped_slice = current_slice.lstrip()
+                name_end = stripped_slice.find(">")
+                if name_end != -1:
+                    param_name = stripped_slice[:name_end]
+                    if re.match(r"^[A-Za-z_][A-Za-z0-9_\\-]*$", param_name):
+                        rest_of_slice = stripped_slice[name_end + 1 :]
+                        cand_end_param = rest_of_slice.find(self.parameter_end_token)
+                        cand_end_func = rest_of_slice.find(self.function_end_token)
+
+                        candidates = []
+                        if cand_end_param != -1:
+                            candidates.append(
+                                (cand_end_param, len(self.parameter_end_token))
+                            )
+                        if cand_end_func != -1:
+                            candidates.append((cand_end_func, 0))
+
+                        if candidates:
+                            func_name = tools[0].function.name
+                            self.current_tool_id += 1
+                            self.current_tool_name_sent = True
+                            self.current_tool_param_count = 0
+                            self.json_started = False
+                            self.current_func_name = func_name
+                            self.is_inside_tool_call = True
+
+                            calls.append(
+                                ToolCallItem(
+                                    tool_index=self.current_tool_id,
+                                    name=func_name,
+                                    parameters="",
+                                )
+                            )
+
+                            best_cand = min(candidates, key=lambda x: x[0])
+                            end_pos = best_cand[0]
+                            end_token_len = best_cand[1]
+                            raw_value = rest_of_slice[:end_pos]
+
+                            if raw_value.startswith("\n"):
+                                raw_value = raw_value[1:]
+                            if raw_value.endswith("\n"):
+                                raw_value = raw_value[:-1]
+
+                            calls.append(
+                                ToolCallItem(
+                                    tool_index=self.current_tool_id, parameters="{"
+                                )
+                            )
+                            self.json_started = True
+
+                            param_config = self._get_arguments_config(func_name, tools)
+                            converted_val = self._convert_param_value(
+                                raw_value, param_name, param_config, func_name
+                            )
+                            json_key_val = f"{json.dumps(param_name)}: {json.dumps(converted_val, ensure_ascii=False)}"
+                            calls.append(
+                                ToolCallItem(
+                                    tool_index=self.current_tool_id,
+                                    parameters=json_key_val,
+                                )
+                            )
+                            self.current_tool_param_count = 1
+
+                            self.parsed_pos += (
+                                leading_ws + name_end + 1 + end_pos + end_token_len
+                            )
+                            continue
+
+                break
+
             # -------------------------------------------------------
             # 4. Function End: </function>
             # -------------------------------------------------------
