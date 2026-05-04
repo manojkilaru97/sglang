@@ -67,7 +67,11 @@ logger = logging.getLogger(__name__)
 
 def _get_response_json_schema(request: ChatCompletionRequest) -> Optional[Any]:
     if request.response_format and request.response_format.type == "json_schema":
-        return getattr(request.response_format.json_schema, "schema_", None)
+        json_schema = request.response_format.json_schema
+        schema = getattr(json_schema, "schema_", None)
+        if schema is None and hasattr(json_schema, "model_dump"):
+            schema = json_schema.model_dump(by_alias=True).get("schema")
+        return schema
     structured_outputs = getattr(request, "structured_outputs", None) or {}
     schema = structured_outputs.get("json")
     return schema if isinstance(schema, dict) else None
@@ -132,6 +136,10 @@ def _default_string_for_pattern(schema: Dict[str, Any], pattern: str) -> str:
 def _repair_json_value(value: Any, schema: Any) -> Any:
     if not isinstance(schema, dict):
         return value
+
+    enum = schema.get("enum")
+    if isinstance(enum, list) and enum:
+        return value if value in enum else enum[0]
 
     variants = schema.get("oneOf") or schema.get("anyOf")
     if isinstance(variants, list):
@@ -533,7 +541,7 @@ class OpenAIServingChat(OpenAIServingBase):
             and request.tool_choice.lower() == "required"
             and not request.tools
         ):
-            return "Tools cannot be empty if tool choice is set to required."
+            return "When using `tool_choice`, `tools` must be set."
 
         if request.tool_choice is not None and not isinstance(request.tool_choice, str):
             if not request.tools:
@@ -541,7 +549,7 @@ class OpenAIServingChat(OpenAIServingBase):
             tool_name = request.tool_choice.function.name
             tool_exists = any(tool.function.name == tool_name for tool in request.tools)
             if not tool_exists:
-                return f"Tool '{tool_name}' not found in tools list."
+                return f"Tool '{tool_name}' not found in the tools list."
 
         # Validate tool definitions
         for i, tool in enumerate(request.tools or []):
@@ -567,7 +575,7 @@ class OpenAIServingChat(OpenAIServingBase):
         if request.response_format and request.response_format.type == "json_schema":
             schema = getattr(request.response_format.json_schema, "schema_", None)
             if schema is None:
-                return "schema_ is required for json_schema response format request."
+                return "'json_schema' field must be provided for json_schema response format request."
 
         return None
 
@@ -743,6 +751,55 @@ class OpenAIServingChat(OpenAIServingBase):
             result = self._apply_conversation_template(request, is_multimodal)
 
         result.tool_call_constraint = tool_call_constraint
+
+        # When reasoning is on we must use a structural_tag constraint so the
+        # model can emit free-form `<think>...` before the tool call. Unlike
+        # the json_schema path that wraps everything in an array with
+        # `maxItems`, structural_tag allows the trigger to fire repeatedly,
+        # so a tool-locked request can keep emitting back-to-back tool calls
+        # forever. For the cases where exactly one tool call is expected
+        # (named tool_choice, or required+parallel=False), use the structural
+        # tag's own `end` literal as a stop string so the request terminates
+        # the moment xgrammar emits the section terminator after the first
+        # call.
+        if (
+            tool_call_constraint
+            and tool_call_constraint[0] == "structural_tag"
+            and (
+                isinstance(request.tool_choice, ToolChoice)
+                or (
+                    request.tool_choice == "required"
+                    and not request.parallel_tool_calls
+                )
+            )
+        ):
+            # `structure.end` is the literal sequence xgrammar emits at the
+            # close of one tool call (e.g. for kimi_k2:
+            # `<|tool_call_end|><|tool_calls_section_end|>`). We stop on the
+            # OUTER section terminator only — sglang strips the matched stop
+            # from the response, and the per-call inner end token must remain
+            # so the tool-call parser's regex can recognize the call.
+            tag = tool_call_constraint[1]
+            terminators: set[str] = set()
+            for struct in getattr(tag, "structures", []) or []:
+                end = getattr(struct, "end", None)
+                if not isinstance(end, str) or not end:
+                    continue
+                # Heuristic: split into per-call inner end + section end. We
+                # take only the trailing token that closes the section. If
+                # there is no obvious split, fall back to the full end.
+                section_marker = "<|tool_calls_section_end|>"
+                terminators.add(section_marker if section_marker in end else end)
+            if terminators:
+                if isinstance(result.stop, str):
+                    result.stop = [result.stop, *terminators]
+                elif isinstance(result.stop, list):
+                    for term in terminators:
+                        if term not in result.stop:
+                            result.stop.append(term)
+                else:
+                    result.stop = list(terminators)
+
         return result
 
     def _apply_jinja_template(
@@ -993,10 +1050,106 @@ class OpenAIServingChat(OpenAIServingBase):
         except ValueError as e:
             return self.create_error_response(str(e))
 
+        stream_state = {
+            "id": str(getattr(request, "rid", "") or ""),
+            "content": [],
+            "reasoning_content": [],
+            "tool_calls": {},
+            "finish_reason": None,
+            "usage": None,
+        }
+
+        def observe_stream_chunk(raw_chunk: str) -> None:
+            if not isinstance(raw_chunk, str):
+                return
+            for raw_line in raw_chunk.splitlines():
+                line = raw_line.strip()
+                if not line:
+                    continue
+                if line.startswith("data: "):
+                    line = line[6:]
+                if line == "[DONE]":
+                    continue
+                try:
+                    payload = json.loads(line)
+                except Exception:
+                    continue
+                if payload.get("usage") is not None:
+                    stream_state["usage"] = payload.get("usage")
+                if payload.get("id"):
+                    stream_state["id"] = str(payload["id"])
+                for choice in payload.get("choices") or []:
+                    delta = choice.get("delta") or {}
+                    if delta.get("content"):
+                        stream_state["content"].append(delta["content"])
+                    reasoning_delta = delta.get("reasoning_content") or delta.get(
+                        "reasoning"
+                    )
+                    if reasoning_delta:
+                        stream_state["reasoning_content"].append(reasoning_delta)
+                    for tc in delta.get("tool_calls") or []:
+                        idx = int(tc.get("index", 0))
+                        calls = stream_state["tool_calls"]
+                        item = calls.setdefault(
+                            idx,
+                            {
+                                "id": tc.get("id"),
+                                "type": tc.get("type", "function"),
+                                "function": {"name": None, "arguments": ""},
+                            },
+                        )
+                        if tc.get("id"):
+                            item["id"] = tc.get("id")
+                        if tc.get("type"):
+                            item["type"] = tc.get("type")
+                        fn = tc.get("function") or {}
+                        if fn.get("name"):
+                            item["function"]["name"] = fn["name"]
+                        if fn.get("arguments"):
+                            item["function"]["arguments"] += fn["arguments"]
+                    if choice.get("finish_reason") is not None:
+                        stream_state["finish_reason"] = choice.get("finish_reason")
+
+        def build_logged_stream_response() -> dict:
+            content = "".join(stream_state["content"])
+            reasoning = "".join(stream_state["reasoning_content"])
+            tool_calls = [
+                stream_state["tool_calls"][idx]
+                for idx in sorted(stream_state["tool_calls"])
+            ]
+            message = {
+                "role": "assistant",
+                "content": content or None,
+                "tool_calls": tool_calls,
+            }
+            if reasoning:
+                message["reasoning_content"] = reasoning
+            return {
+                "id": stream_state["id"] or getattr(request, "rid", ""),
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": request.model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": message,
+                        "finish_reason": stream_state["finish_reason"],
+                    }
+                ],
+                "usage": stream_state["usage"],
+            }
+
         async def prepend_first_chunk():
+            observe_stream_chunk(first_chunk)
             yield first_chunk
             async for chunk in generator:
+                observe_stream_chunk(chunk)
                 yield chunk
+            self.tokenizer_manager.request_logger.log_openai_response(
+                build_logged_stream_response(),
+                request=raw_request,
+                rid=getattr(request, "rid", None),
+            )
 
         return StreamingResponse(
             prepend_first_chunk(),
@@ -1054,6 +1207,8 @@ class OpenAIServingChat(OpenAIServingBase):
         # State tracking for streaming
         is_firsts = {}
         stream_buffers = {}
+        visible_reasoning_parts = {}
+        visible_content_parts = {}
         n_prev_tokens = {}
         has_tool_calls = {}
         finish_reasons = {}
@@ -1172,6 +1327,9 @@ class OpenAIServingChat(OpenAIServingBase):
                     if reasoning_text and request.tool_choice != "none" and request.tools:
                         reasoning_text = _strip_tool_control_markers(reasoning_text)
                     if reasoning_text:
+                        visible_reasoning_parts.setdefault(index, []).append(
+                            reasoning_text
+                        )
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=index,
                             delta=DeltaMessage(reasoning_content=reasoning_text),
@@ -1215,6 +1373,36 @@ class OpenAIServingChat(OpenAIServingBase):
                         if chunk:
                             yield chunk
 
+                    parser = parser_dict.get(index)
+                    if (
+                        request.parallel_tool_calls is False
+                        and isinstance(parser, FunctionCallParser)
+                    ):
+                        detector = getattr(parser, "detector", None)
+                        if (
+                            getattr(detector, "current_tool_id", -1) >= 1
+                            and not getattr(detector, "current_tool_name_sent", True)
+                        ):
+                            remaining_chunk = self._check_for_unstreamed_tool_args(
+                                parser, content, request, index
+                            )
+                            if remaining_chunk:
+                                yield remaining_chunk
+                            finish_reasons[index] = {
+                                "type": "tool_calls",
+                                "matched": None,
+                            }
+                            force_finish = True
+                            if adapted_request.is_single:
+                                self.tokenizer_manager.abort_request(
+                                    adapted_request.rid
+                                )
+                            else:
+                                self.tokenizer_manager.abort_request(
+                                    adapted_request.rid[index]
+                                )
+                            break
+
                     # Send any remaining tool call arguments when generation finishes
                     if finish_reason_type is not None and index in parser_dict:
                         parser = parser_dict[index]
@@ -1244,6 +1432,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 else:
                     # Regular content
                     if delta and not buffer_response_json:
+                        visible_content_parts.setdefault(index, []).append(delta)
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=index,
                             delta=DeltaMessage(content=delta),
@@ -1315,6 +1504,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     final_text = _repair_json_text(
                         stream_buffers[idx], response_json_schema
                     )
+                    visible_content_parts.setdefault(idx, []).append(final_text)
                     choice_data = ChatCompletionResponseStreamChoice(
                         index=idx,
                         delta=DeltaMessage(content=final_text),
@@ -1393,10 +1583,31 @@ class OpenAIServingChat(OpenAIServingBase):
 
             # Additional usage chunk
             if include_usage:
+                usage_completion_tokens = dict(completion_tokens)
+                usage_reasoning_tokens = dict(reasoning_tokens)
+                if not (request.tool_choice != "none" and request.tools):
+                    tokenizer = self.tokenizer_manager.tokenizer
+
+                    def count_visible_tokens(parts: List[str]) -> int:
+                        text = "".join(parts)
+                        if not text:
+                            return 0
+                        return len(tokenizer.encode(text, add_special_tokens=False))
+
+                    for idx in finish_reasons:
+                        reasoning_count = count_visible_tokens(
+                            visible_reasoning_parts.get(idx, [])
+                        )
+                        content_count = count_visible_tokens(
+                            visible_content_parts.get(idx, [])
+                        )
+                        usage_reasoning_tokens[idx] = reasoning_count
+                        usage_completion_tokens[idx] = reasoning_count + content_count
+
                 usage = UsageProcessor.calculate_streaming_usage(
                     prompt_tokens,
-                    reasoning_tokens,
-                    completion_tokens,
+                    usage_reasoning_tokens,
+                    usage_completion_tokens,
                     cached_tokens=cached_tokens,
                     n_choices=request.n,
                     enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
@@ -1666,6 +1877,14 @@ class OpenAIServingChat(OpenAIServingBase):
                     history_tool_calls_cnt,
                 )
 
+            response_json_schema = _get_response_json_schema(request)
+            if (
+                response_json_schema is not None
+                and response_json_schema is not False
+                and not (request.tool_choice != "none" and request.tools)
+            ):
+                text = _repair_json_text(text, response_json_schema)
+
             choice_data = ChatCompletionResponseChoice(
                 index=idx,
                 message=ChatMessage(
@@ -1888,11 +2107,14 @@ class OpenAIServingChat(OpenAIServingBase):
             )
             if should_try_parser and parser.has_tool_call(text):
                 original_finish_type = finish_reason["type"]
-                if finish_reason["type"] == "stop":
-                    finish_reason["type"] = "tool_calls"
-                    finish_reason["matched"] = None
                 try:
                     text, call_info_list = parser.parse_non_stream(text)
+                    if not call_info_list:
+                        finish_reason["type"] = original_finish_type
+                        return ToolCallProcessingResult(None, text, finish_reason)
+                    if finish_reason["type"] == "stop":
+                        finish_reason["type"] = "tool_calls"
+                        finish_reason["matched"] = None
                     tool_calls = []
                     for call_info in call_info_list:
                         tool_id = self._process_tool_call_id(
@@ -1965,11 +2187,15 @@ class OpenAIServingChat(OpenAIServingBase):
         # Use parser since output is not constrained by JSON schema
         parser = FunctionCallParser(tools, self.tool_call_parser)
         if parser.has_tool_call(text):
+            original_finish_type = finish_reason["type"]
             if finish_reason["type"] == "stop":
                 finish_reason["type"] = "tool_calls"
                 finish_reason["matched"] = None
             try:
                 text, call_info_list = parser.parse_non_stream(text)
+                if not call_info_list:
+                    finish_reason["type"] = original_finish_type
+                    return ToolCallProcessingResult(None, text, finish_reason)
                 tool_calls = []
                 for call_info in call_info_list:
                     tool_id = self._process_tool_call_id(

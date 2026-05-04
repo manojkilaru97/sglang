@@ -48,10 +48,13 @@ from sglang.srt.entrypoints.harmony_utils import (
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageParam,
     ChatCompletionRequest,
+    Function,
     PromptTokenUsageInfo,
     RequestResponseMetadata,
     ResponsesRequest,
     ResponsesResponse,
+    Tool,
+    ToolChoice,
     UsageInfo,
 )
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
@@ -187,12 +190,20 @@ class OpenAIServingResponses(OpenAIServingChat):
             model_name = request.model
             tokenizer = self.tokenizer_manager.tokenizer
 
+            chat_request = None
+            processed_messages = None
             if self.use_harmony:
-                messages, request_prompts, engine_prompts = (
+                messages, request_prompts, engine_prompts, _, _ = (
                     self._make_request_with_harmony(request, prev_response)
                 )
             else:
-                messages, request_prompts, engine_prompts = await self._make_request(
+                (
+                    messages,
+                    request_prompts,
+                    engine_prompts,
+                    chat_request,
+                    processed_messages,
+                ) = await self._make_request(
                     request, prev_response, tokenizer
                 )
 
@@ -262,9 +273,23 @@ class OpenAIServingResponses(OpenAIServingChat):
                     default_max_tokens = max(
                         context_len - prompt_length - num_reserved_tokens, 512
                     )  # Ensure minimum 512 tokens
-                    sampling_params = request.to_sampling_params(
-                        default_max_tokens, self.default_sampling_params
-                    )
+                    if chat_request is not None and processed_messages is not None:
+                        sampling_params = chat_request.to_sampling_params(
+                            stop=processed_messages.stop,
+                            model_generation_config=self.default_sampling_params,
+                            tool_call_constraint=processed_messages.tool_call_constraint,
+                        )
+                        max_new_tokens = sampling_params.get("max_new_tokens")
+                        if max_new_tokens is None:
+                            sampling_params["max_new_tokens"] = default_max_tokens - 2
+                        else:
+                            sampling_params["max_new_tokens"] = min(
+                                max_new_tokens, default_max_tokens - 2
+                            )
+                    else:
+                        sampling_params = request.to_sampling_params(
+                            default_max_tokens, self.default_sampling_params
+                        )
 
                     context: ConversationContext
                     if self.use_harmony:
@@ -275,14 +300,31 @@ class OpenAIServingResponses(OpenAIServingChat):
                     else:
                         context = SimpleContext()
 
+                    if isinstance(engine_prompt, str):
+                        prompt_kwargs = {"text": engine_prompt}
+                    elif (
+                        isinstance(engine_prompt, list)
+                        and engine_prompt
+                        and isinstance(engine_prompt[0], int)
+                    ):
+                        prompt_kwargs = {"input_ids": engine_prompt}
+                    else:
+                        prompt_kwargs = {"text": engine_prompt}
+
                     # Create GenerateReqInput for SGLang
                     adapted_request = GenerateReqInput(
-                        input_ids=engine_prompt,
+                        **prompt_kwargs,
                         sampling_params=sampling_params,
                         stream=request.stream,
                         rid=request.request_id,
                         extra_key=self._compute_extra_key(request),
                         background=request.background,
+                        require_reasoning=(
+                            self._get_reasoning_from_request(chat_request)
+                            if chat_request is not None
+                            else False
+                        ),
+                        priority=request.priority,
                     )
 
                     generator = self._generate_with_builtin_tools(
@@ -329,6 +371,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                         model_name,
                         tokenizer,
                         request_metadata,
+                        chat_request,
                         created_time,
                     ),
                     name=f"create_{response.id}",
@@ -350,6 +393,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                     model_name,
                     tokenizer,
                     request_metadata,
+                    chat_request=chat_request,
                 )
             try:
                 result: Union[ORJSONResponse, ResponsesResponse] = (
@@ -361,6 +405,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                         model_name,
                         tokenizer,
                         request_metadata,
+                        chat_request=chat_request,
                     )
                 )
                 return result
@@ -384,6 +429,25 @@ class OpenAIServingResponses(OpenAIServingChat):
                 model=request.model,
                 messages=messages,
                 stream=request.stream,
+                tools=self._responses_tools_to_chat_tools(request.tools),
+                tool_choice=self._responses_tool_choice_to_chat_tool_choice(
+                    request.tool_choice
+                ),
+                parallel_tool_calls=bool(request.parallel_tool_calls),
+                response_format=self._responses_text_to_chat_response_format(request.text),
+                max_tokens=request.max_output_tokens,
+                temperature=request.temperature,
+                top_p=request.top_p,
+                stop=request.stop,
+                frequency_penalty=request.frequency_penalty,
+                presence_penalty=request.presence_penalty,
+                top_k=request.top_k,
+                min_p=request.min_p,
+                repetition_penalty=request.repetition_penalty,
+                reasoning_effort=self._responses_reasoning_effort(request),
+                chat_template_kwargs=self._responses_chat_template_kwargs(request),
+                rid=request.request_id,
+                priority=request.priority,
             )
 
             # Follow SGLang's _process_messages pattern
@@ -400,6 +464,8 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         except Exception as e:
             logger.warning(f"Chat processing failed, using fallback: {e}")
+            chat_request = None
+            processed_messages = None
             # Fallback to simple encoding
             prompt_text = ""
             for msg in messages:
@@ -410,7 +476,101 @@ class OpenAIServingResponses(OpenAIServingChat):
             request_prompts = [prompt_ids]
             engine_prompts = [prompt_ids]
 
-        return messages, request_prompts, engine_prompts
+        return messages, request_prompts, engine_prompts, chat_request, processed_messages
+
+    def _responses_reasoning_effort(self, request: ResponsesRequest) -> Optional[str]:
+        if request.reasoning is None:
+            return None
+        return request.reasoning.effort
+
+    def _responses_chat_template_kwargs(
+        self, request: ResponsesRequest
+    ) -> Optional[dict[str, bool]]:
+        if self._responses_has_structured_text(request):
+            return {"thinking": False, "enable_thinking": False}
+        effort = self._responses_reasoning_effort(request)
+        if effort is None:
+            return None
+        thinking = effort != "none"
+        return {"thinking": thinking, "enable_thinking": thinking}
+
+    def _responses_has_structured_text(self, request: ResponsesRequest) -> bool:
+        text = request.text
+        if not isinstance(text, dict):
+            return False
+        fmt = text.get("format")
+        return isinstance(fmt, dict) and fmt.get("type") in {
+            "json_object",
+            "json_schema",
+        }
+
+    def _responses_tools_to_chat_tools(
+        self, tools: list[Any] | None
+    ) -> Optional[list[Tool]]:
+        if not tools:
+            return None
+        chat_tools: list[Tool] = []
+        for tool in tools:
+            raw = tool.model_dump(exclude_none=True) if hasattr(tool, "model_dump") else tool
+            if not isinstance(raw, dict) or raw.get("type") != "function":
+                continue
+            fn = raw.get("function")
+            if not isinstance(fn, dict):
+                fn = {
+                    "name": raw.get("name"),
+                    "description": raw.get("description"),
+                    "parameters": raw.get("parameters"),
+                    "strict": raw.get("strict", False),
+                }
+            if not fn.get("name"):
+                continue
+            chat_tools.append(
+                Tool(
+                    type="function",
+                    function=Function(
+                        name=fn["name"],
+                        description=fn.get("description"),
+                        parameters=fn.get("parameters"),
+                        strict=bool(fn.get("strict", False)),
+                    ),
+                )
+            )
+        return chat_tools or None
+
+    def _responses_tool_choice_to_chat_tool_choice(self, tool_choice: Any):
+        if isinstance(tool_choice, ToolChoice):
+            return tool_choice
+        if not isinstance(tool_choice, dict):
+            return tool_choice
+        name = tool_choice.get("name")
+        fn = tool_choice.get("function")
+        if isinstance(fn, dict):
+            name = fn.get("name") or name
+        if tool_choice.get("type") == "function" and name:
+            return ToolChoice(function={"name": name})
+        return "auto"
+
+    def _responses_text_to_chat_response_format(
+        self, text: Optional[dict]
+    ) -> Optional[dict[str, Any]]:
+        if not isinstance(text, dict):
+            return None
+        fmt = text.get("format")
+        if not isinstance(fmt, dict):
+            return None
+        if fmt.get("type") == "json_schema":
+            return {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": fmt.get("name") or "Schema",
+                    "description": fmt.get("description"),
+                    "schema": fmt.get("schema"),
+                    "strict": bool(fmt.get("strict", False)),
+                },
+            }
+        if fmt.get("type") in {"text", "json_object"}:
+            return {"type": fmt["type"]}
+        return None
 
     def _make_request_with_harmony(
         self,
@@ -424,7 +584,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         messages = self._construct_input_messages_with_harmony(request, prev_response)
         prompt_token_ids = render_for_completion(messages)
         engine_prompt = prompt_token_ids
-        return messages, [prompt_token_ids], [engine_prompt]
+        return messages, [prompt_token_ids], [engine_prompt], None, None
 
     async def responses_full_generator(
         self,
@@ -435,6 +595,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         model_name: str,
         tokenizer: Any,
         request_metadata: RequestResponseMetadata,
+        chat_request: Optional[ChatCompletionRequest] = None,
         created_time: Optional[int] = None,
     ) -> Union[ResponsesResponse, ORJSONResponse]:
         if created_time is None:
@@ -462,14 +623,23 @@ class OpenAIServingResponses(OpenAIServingChat):
             assert final_res is not None
 
             output = self._make_response_output_items(
-                request, final_res["text"], tokenizer
+                request, final_res, tokenizer, chat_request=chat_request
             )
 
             # Calculate usage from actual output
-            if hasattr(final_res, "meta_info"):
+            if isinstance(final_res, dict) and isinstance(
+                final_res.get("meta_info"), dict
+            ):
+                meta_info = final_res["meta_info"]
+                num_prompt_tokens = meta_info.get("prompt_tokens", 0)
+                num_generated_tokens = meta_info.get("completion_tokens", 0)
+                num_cached_tokens = meta_info.get("cached_tokens", 0)
+                num_reasoning_tokens = meta_info.get("reasoning_tokens", 0)
+            elif hasattr(final_res, "meta_info"):
                 num_prompt_tokens = final_res.meta_info.get("prompt_tokens", 0)
                 num_generated_tokens = final_res.meta_info.get("completion_tokens", 0)
                 num_cached_tokens = final_res.meta_info.get("cached_tokens", 0)
+                num_reasoning_tokens = final_res.meta_info.get("reasoning_tokens", 0)
             elif hasattr(final_res, "prompt_token_ids") and hasattr(
                 final_res, "outputs"
             ):
@@ -525,9 +695,11 @@ class OpenAIServingResponses(OpenAIServingChat):
     def _make_response_output_items(
         self,
         request: ResponsesRequest,
-        final_output: Any,
+        final_res: Any,
         tokenizer: Any,
+        chat_request: Optional[ChatCompletionRequest] = None,
     ):
+        final_output = final_res.get("text", "") if isinstance(final_res, dict) else final_res
         # Handle reasoning parsing if enabled
         if self.reasoning_parser:
             # Use standard reasoning parser (openai maps to T4Detector internally)
@@ -542,6 +714,35 @@ class OpenAIServingResponses(OpenAIServingChat):
             content = final_output
 
         output_items = []
+        if chat_request is not None and chat_request.tools and content:
+            finish_reason = (
+                (final_res.get("meta_info") or {}).get("finish_reason") or {}
+                if isinstance(final_res, dict)
+                else {}
+            )
+            if not isinstance(finish_reason, dict):
+                finish_reason = {"type": str(finish_reason), "matched": None}
+            processed = self._process_tool_calls(
+                content,
+                chat_request.tools,
+                finish_reason,
+                chat_request.tool_choice,
+                history_tool_calls_cnt=0,
+            )
+            if processed.tool_calls:
+                for tool_call in processed.tool_calls:
+                    random_id = random_uuid()
+                    output_items.append(
+                        ResponseFunctionToolCall(
+                            arguments=tool_call.function.arguments,
+                            call_id=tool_call.id or f"call_{random_id}",
+                            type="function_call",
+                            name=tool_call.function.name,
+                            id=f"ft_{random_id}",
+                        )
+                    )
+                content = processed.remaining_text
+
         if reasoning_content:
             reasoning_item = ResponseReasoningItem(
                 id=f"rs_{random_uuid()}",
@@ -711,6 +912,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         model_name: str,
         tokenizer: Any,
         request_metadata: RequestResponseMetadata,
+        chat_request: Optional[ChatCompletionRequest] = None,
         created_time: Optional[int] = None,
         *args,
         **kwargs,
@@ -730,7 +932,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                 model_name,
                 tokenizer,
                 request_metadata,
-                created_time,
+                chat_request=chat_request,
+                created_time=created_time,
                 *args,
                 **kwargs,
             )
@@ -821,6 +1024,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         model_name: str,
         tokenizer: Any,
         request_metadata: RequestResponseMetadata,
+        chat_request: Optional[ChatCompletionRequest] = None,
         created_time: Optional[int] = None,
     ) -> AsyncGenerator[str, None]:
         # TODO:
@@ -1227,25 +1431,144 @@ class OpenAIServingResponses(OpenAIServingChat):
             model_name,
             tokenizer,
             request_metadata,
+            chat_request=chat_request,
             created_time=created_time,
         )
+        for output_index, item in enumerate(final_response.output):
+            if isinstance(item, ResponseOutputMessage):
+                yield _send_event(
+                    openai_responses_types.ResponseOutputItemAddedEvent(
+                        type="response.output_item.added",
+                        sequence_number=-1,
+                        output_index=output_index,
+                        item=openai_responses_types.ResponseOutputMessage(
+                            id=item.id,
+                            type="message",
+                            role="assistant",
+                            content=[],
+                            status="in_progress",
+                        ),
+                    )
+                )
+                for content_index, part in enumerate(item.content):
+                    if not isinstance(part, ResponseOutputText):
+                        continue
+                    yield _send_event(
+                        openai_responses_types.ResponseContentPartAddedEvent(
+                            type="response.content_part.added",
+                            sequence_number=-1,
+                            output_index=output_index,
+                            item_id=item.id,
+                            content_index=content_index,
+                            part=openai_responses_types.ResponseOutputText(
+                                type="output_text",
+                                text="",
+                                annotations=[],
+                                logprobs=None,
+                            ),
+                        )
+                    )
+                    if part.text:
+                        yield _send_event(
+                            openai_responses_types.ResponseTextDeltaEvent(
+                                type="response.output_text.delta",
+                                sequence_number=-1,
+                                content_index=content_index,
+                                output_index=output_index,
+                                item_id=item.id,
+                                delta=part.text,
+                                logprobs=[],
+                            )
+                        )
+                    yield _send_event(
+                        openai_responses_types.ResponseTextDoneEvent(
+                            type="response.output_text.done",
+                            sequence_number=-1,
+                            output_index=output_index,
+                            content_index=content_index,
+                            item_id=item.id,
+                            text=part.text,
+                            logprobs=[],
+                        )
+                    )
+                    yield _send_event(
+                        openai_responses_types.ResponseContentPartDoneEvent(
+                            type="response.content_part.done",
+                            sequence_number=-1,
+                            item_id=item.id,
+                            output_index=output_index,
+                            content_index=content_index,
+                            part=part,
+                        )
+                    )
+                yield _send_event(
+                    openai_responses_types.ResponseOutputItemDoneEvent(
+                        type="response.output_item.done",
+                        sequence_number=-1,
+                        output_index=output_index,
+                        item=item,
+                    )
+                )
+                continue
+            if not isinstance(item, ResponseFunctionToolCall):
+                continue
+            in_progress_item = item.model_copy(update={"status": "in_progress"})
+            completed_item = item.model_copy(update={"status": "completed"})
+            yield _send_event(
+                openai_responses_types.ResponseOutputItemAddedEvent(
+                    type="response.output_item.added",
+                    sequence_number=-1,
+                    output_index=output_index,
+                    item=in_progress_item,
+                )
+            )
+            if item.arguments:
+                yield _send_event(
+                    openai_responses_types.ResponseFunctionCallArgumentsDeltaEvent(
+                        type="response.function_call_arguments.delta",
+                        sequence_number=-1,
+                        output_index=output_index,
+                        item_id=item.id or item.call_id,
+                        delta=item.arguments,
+                    )
+                )
+            yield _send_event(
+                openai_responses_types.ResponseFunctionCallArgumentsDoneEvent(
+                    type="response.function_call_arguments.done",
+                    sequence_number=-1,
+                    output_index=output_index,
+                    item_id=item.id or item.call_id,
+                    name=item.name,
+                    arguments=item.arguments,
+                )
+            )
+            yield _send_event(
+                openai_responses_types.ResponseOutputItemDoneEvent(
+                    type="response.output_item.done",
+                    sequence_number=-1,
+                    output_index=output_index,
+                    item=completed_item,
+                )
+            )
         # Convert final_response to the format expected by ResponseCompletedEvent
         response_dict = final_response.model_dump()
 
         # Convert UsageInfo to ResponseUsage format
         if response_dict.get("usage"):
             usage_info = response_dict["usage"]
-            response_dict["usage"] = {
-                "input_tokens": usage_info.get("prompt_tokens", 0),
-                "input_tokens_details": {
-                    "cached_tokens": usage_info.get("cached_tokens", 0)
-                },
-                "output_tokens": usage_info.get("completion_tokens", 0),
-                "output_tokens_details": {
-                    "reasoning_tokens": usage_info.get("reasoning_tokens", 0)
-                },
-                "total_tokens": usage_info.get("total_tokens", 0),
-            }
+            if "prompt_tokens" in usage_info:
+                prompt_details = usage_info.get("prompt_tokens_details") or {}
+                response_dict["usage"] = {
+                    "input_tokens": usage_info.get("prompt_tokens", 0),
+                    "input_tokens_details": {
+                        "cached_tokens": prompt_details.get("cached_tokens", 0)
+                    },
+                    "output_tokens": usage_info.get("completion_tokens", 0),
+                    "output_tokens_details": {
+                        "reasoning_tokens": usage_info.get("reasoning_tokens", 0)
+                    },
+                    "total_tokens": usage_info.get("total_tokens", 0),
+                }
 
         yield _send_event(
             openai_responses_types.ResponseCompletedEvent(

@@ -92,12 +92,14 @@ def _get_tool_schema_defs(tools: List[Tool]) -> dict:
 
 def _get_tool_schema(tool: Tool) -> dict:
     return {
+        "type": "object",
+        "additionalProperties": False,
         "properties": {
             "name": {"type": "string", "enum": [tool.function.name]},
             "parameters": (
                 _bound_tool_argument_schema(tool.function.parameters)
                 if tool.function.parameters
-                else {"type": "object", "properties": {}}
+                else {"type": "object", "properties": {}, "additionalProperties": False}
             ),
         },
         "required": ["name", "parameters"],
@@ -184,6 +186,36 @@ def _bound_tool_argument_schema(schema: Any, field_name: Optional[str] = None) -
         and "additionalProperties" not in capped
     ):
         capped["additionalProperties"] = False
+
+    if is_object and not isinstance(capped.get("properties"), dict):
+        # Free-form `{type: object}` with no declared properties. xgrammar
+        # otherwise lets the model emit arbitrarily nested JSON for additional
+        # properties forever. Bound the values to scalars and the keys to a
+        # short string so the grammar terminates.
+        existing_addl = capped.get("additionalProperties")
+        if existing_addl is None or existing_addl is True:
+            string_max = _tool_arg_string_max_length(field_name)
+            scalar_string_schema: Dict[str, Any] = {"type": "string"}
+            if string_max > 0:
+                scalar_string_schema["maxLength"] = string_max
+                scalar_string_schema["pattern"] = rf"^[^\n]{{0,{string_max}}}$"
+            capped["additionalProperties"] = {
+                "anyOf": [
+                    scalar_string_schema,
+                    {"type": "number"},
+                    {"type": "boolean"},
+                    {"type": "null"},
+                ]
+            }
+            property_name_max = min(128, string_max) if string_max > 0 else 128
+            capped.setdefault(
+                "propertyNames",
+                {
+                    "type": "string",
+                    "maxLength": property_name_max,
+                    "pattern": rf"^[^\n]{{1,{property_name_max}}}$",
+                },
+            )
 
     for key in ("properties", "$defs", "definitions"):
         values = capped.get(key)

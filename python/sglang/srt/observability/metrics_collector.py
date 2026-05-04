@@ -796,6 +796,24 @@ class SchedulerMetricsCollector:
             labelnames=["page_size", "num_pages"],
             multiprocess_mode="mostrecent",
         )
+        self.model_config_info = Gauge(
+            name="sglang:model_config_info",
+            documentation="Model configuration information.",
+            labelnames=[],
+            multiprocess_mode="mostrecent",
+        )
+        self.parallel_config_info = Gauge(
+            name="sglang:parallel_config_info",
+            documentation="Parallel configuration information.",
+            labelnames=[],
+            multiprocess_mode="mostrecent",
+        )
+        self.detailed_config_info = Gauge(
+            name="sglang:detailed_config_info",
+            documentation="Detailed engine configuration information.",
+            labelnames=[],
+            multiprocess_mode="mostrecent",
+        )
 
     def _log_gauge(self, gauge: Gauge, data: Union[int, float]) -> None:
         # Convenience function for logging a scalar to gauge.
@@ -1087,6 +1105,11 @@ class SchedulerMetricsCollector:
     def emit_cache_config_info(self, page_size: int, num_pages: int) -> None:
         self.cache_config_info.labels(page_size=page_size, num_pages=num_pages).set(1)
 
+    def emit_engine_config_info(self) -> None:
+        self.model_config_info.set(1)
+        self.parallel_config_info.set(1)
+        self.detailed_config_info.set(1)
+
 
 class TokenizerMetricsCollector:
     def __init__(
@@ -1190,6 +1213,82 @@ class TokenizerMetricsCollector:
             documentation="Number of requests aborted.",
             labelnames=labels.keys(),
         )
+        self.request_type_image_total = Counter(
+            name="sglang:request_type_image_total",
+            documentation="Number of OpenAI requests containing image inputs.",
+            labelnames=labels.keys(),
+        )
+        self.request_type_video_total = Counter(
+            name="sglang:request_type_video_total",
+            documentation="Number of OpenAI requests containing video inputs.",
+            labelnames=labels.keys(),
+        )
+        self.request_type_audio_total = Counter(
+            name="sglang:request_type_audio_total",
+            documentation="Number of OpenAI requests containing audio inputs.",
+            labelnames=labels.keys(),
+        )
+        self.request_type_tool_call_total = Counter(
+            name="sglang:request_type_tool_call_total",
+            documentation="Number of OpenAI requests containing tool definitions.",
+            labelnames=labels.keys(),
+        )
+        self.request_type_structured_output_total = Counter(
+            name="sglang:request_type_structured_output_total",
+            documentation="Number of OpenAI requests using structured outputs.",
+            labelnames=labels.keys(),
+        )
+        self.request_input_images_total = Counter(
+            name="sglang:request_input_images_total",
+            documentation="Number of image inputs in OpenAI requests.",
+            labelnames=labels.keys(),
+        )
+        self.request_input_videos_total = Counter(
+            name="sglang:request_input_videos_total",
+            documentation="Number of video inputs in OpenAI requests.",
+            labelnames=labels.keys(),
+        )
+        self.request_input_audios_total = Counter(
+            name="sglang:request_input_audios_total",
+            documentation="Number of audio inputs in OpenAI requests.",
+            labelnames=labels.keys(),
+        )
+        self.request_input_tools_total = Counter(
+            name="sglang:request_input_tools_total",
+            documentation="Number of tool definitions in OpenAI requests.",
+            labelnames=labels.keys(),
+        )
+        self.request_tool_choice_total = Counter(
+            name="sglang:request_tool_choice_total",
+            documentation="Number of OpenAI requests by tool choice.",
+            labelnames=list(labels.keys()) + ["tool_choice"],
+        )
+        self.request_structured_output_kind_total = Counter(
+            name="sglang:request_structured_output_kind_total",
+            documentation="Number of OpenAI structured output requests by kind.",
+            labelnames=list(labels.keys()) + ["kind"],
+        )
+        self.request_structured_output_backend_total = Counter(
+            name="sglang:request_structured_output_backend_total",
+            documentation="Number of OpenAI structured output requests by backend.",
+            labelnames=list(labels.keys()) + ["backend"],
+        )
+        self.request_success_total = Counter(
+            name="sglang:request_success_total",
+            documentation="Number of successful requests.",
+            labelnames=labels.keys(),
+        )
+        self.request_mode_total = Counter(
+            name="sglang:request_mode_total",
+            documentation="Number of requests by mode.",
+            labelnames=list(labels.keys()) + ["mode"],
+        )
+        self.request_outcome_total = Counter(
+            name="sglang:request_outcome_total",
+            documentation="Number of requests by outcome.",
+            labelnames=list(labels.keys()) + ["outcome"],
+        )
+        self.num_aborted_requests_total.labels(**self.labels)
 
         if bucket_time_to_first_token is None:
             bucket_time_to_first_token = [
@@ -1355,6 +1454,9 @@ class TokenizerMetricsCollector:
                 self.cached_tokens_total.labels(**labels_total).inc(cached_tokens)
 
         self.num_requests_total.labels(**labels).inc(1)
+        self.request_success_total.labels(**labels).inc(1)
+        self.request_mode_total.labels(**labels, mode="chat").inc(1)
+        self.request_outcome_total.labels(**labels, outcome="success").inc(1)
         if has_grammar:
             self.num_so_requests_total.labels(**labels).inc(1)
         self.histogram_e2e_request_latency.labels(**labels).observe(float(e2e_latency))
@@ -1398,6 +1500,42 @@ class TokenizerMetricsCollector:
 
     def observe_one_aborted_request(self, labels: Dict[str, str]):
         self.num_aborted_requests_total.labels(**labels).inc(1)
+
+    def observe_openai_request(
+        self,
+        labels: Dict[str, str],
+        *,
+        image_count: int = 0,
+        video_count: int = 0,
+        audio_count: int = 0,
+        tool_count: int = 0,
+        tool_choice: Optional[str] = None,
+        structured_output_kind: Optional[str] = None,
+        structured_output_backend: Optional[str] = None,
+    ):
+        if image_count:
+            self.request_type_image_total.labels(**labels).inc(1)
+            self.request_input_images_total.labels(**labels).inc(image_count)
+        if video_count:
+            self.request_type_video_total.labels(**labels).inc(1)
+            self.request_input_videos_total.labels(**labels).inc(video_count)
+        if audio_count:
+            self.request_type_audio_total.labels(**labels).inc(1)
+            self.request_input_audios_total.labels(**labels).inc(audio_count)
+        if tool_count:
+            self.request_type_tool_call_total.labels(**labels).inc(1)
+            self.request_input_tools_total.labels(**labels).inc(tool_count)
+            self.request_tool_choice_total.labels(
+                **labels, tool_choice=tool_choice or "auto"
+            ).inc(1)
+        if structured_output_kind:
+            self.request_type_structured_output_total.labels(**labels).inc(1)
+            self.request_structured_output_kind_total.labels(
+                **labels, kind=structured_output_kind
+            ).inc(1)
+            self.request_structured_output_backend_total.labels(
+                **labels, backend=structured_output_backend or "xgrammar"
+            ).inc(1)
 
 
 @dataclass

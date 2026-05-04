@@ -128,7 +128,7 @@ class OpenAIServingDetokenize(OpenAIServingBase):
                     f"Invalid tokens type: {type(request.tokens)}. Expected List[int] or List[List[int]]."
                 )
 
-            return DetokenizeResponse(text=text_out)
+            return DetokenizeResponse(text=text_out, prompt=text_out)
         except Exception as e:
             logger.error("Error during detokenization", exc_info=True)
             if "decode" in str(e).lower():

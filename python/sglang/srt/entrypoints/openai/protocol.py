@@ -15,6 +15,7 @@
 
 import json
 import logging
+import os
 import re
 import time
 import uuid
@@ -53,6 +54,37 @@ logger = logging.getLogger(__name__)
 DEFAULT_MODEL_NAME = "default"
 
 
+def _configured_max_output_len() -> Optional[int]:
+    raw = os.environ.get("DYN_MAX_OUTPUT_LEN")
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+def _cap_chat_max_output_len(values: Dict[str, Any]) -> None:
+    cap = _configured_max_output_len()
+    if cap is None:
+        return
+    key = (
+        "max_completion_tokens"
+        if values.get("max_completion_tokens") is not None
+        else "max_tokens"
+    )
+    current = values.get(key)
+    if isinstance(current, int) and current > cap:
+        logger.info(
+            "Capping %s from %s to DYN_MAX_OUTPUT_LEN=%s",
+            key,
+            current,
+            cap,
+        )
+        values[key] = cap
+
+
 def _bound_json_schema(schema: Any) -> Any:
     max_length = envs.SGLANG_TOOL_ARG_STRING_MAX_LENGTH.get()
     max_array_items = envs.SGLANG_TOOL_ARRAY_MAX_ITEMS.get()
@@ -75,7 +107,7 @@ def _bound_json_schema(schema: Any) -> Any:
         or isinstance(capped.get("additionalProperties"), dict)
     )
 
-    if is_string and max_length > 0:
+    if is_string and "enum" not in capped and max_length > 0:
         schema_max_length = capped.get("maxLength")
         string_max_length = (
             min(schema_max_length, max_length)
@@ -217,6 +249,45 @@ class UsageInfo(BaseModel):
     # Used to return cached tokens info when --enable-cache-report is set
     prompt_tokens_details: Optional[PromptTokensDetails] = None
     reasoning_tokens: Optional[int] = 0
+
+
+class ResponseInputTokensDetails(BaseModel):
+    cached_tokens: int = 0
+
+
+class ResponseOutputTokensDetails(BaseModel):
+    reasoning_tokens: int = 0
+
+
+class ResponseUsageInfo(BaseModel):
+    input_tokens: int = 0
+    input_tokens_details: ResponseInputTokensDetails = Field(
+        default_factory=ResponseInputTokensDetails
+    )
+    output_tokens: int = 0
+    output_tokens_details: ResponseOutputTokensDetails = Field(
+        default_factory=ResponseOutputTokensDetails
+    )
+    total_tokens: int = 0
+
+    @classmethod
+    def from_usage_info(cls, usage: Optional[UsageInfo]) -> Optional["ResponseUsageInfo"]:
+        if usage is None:
+            return None
+        cached_tokens = 0
+        if usage.prompt_tokens_details is not None:
+            cached_tokens = usage.prompt_tokens_details.cached_tokens
+        return cls(
+            input_tokens=usage.prompt_tokens,
+            input_tokens_details=ResponseInputTokensDetails(
+                cached_tokens=cached_tokens
+            ),
+            output_tokens=usage.completion_tokens or 0,
+            output_tokens_details=ResponseOutputTokensDetails(
+                reasoning_tokens=usage.reasoning_tokens or 0
+            ),
+            total_tokens=usage.total_tokens,
+        )
 
 
 class StreamOptions(BaseModel):
@@ -631,6 +702,20 @@ class ToolChoice(BaseModel):
     type: Literal["function"] = Field(default="function", examples=["function"])
 
 
+_OPENAI_UNSUPPORTED_BACKEND_FIELDS = {
+    "return_logits",
+    "return_token_ids",
+    "return_logprob",
+    "return_text_in_logprobs",
+    "return_hidden_states",
+    "logits_processors",
+    "logprob_start_len",
+    "top_logprobs_num",
+    "spaces_between_special_tokens",
+    "truncate_prompt_tokens",
+}
+
+
 class ChatCompletionRequest(BaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
@@ -671,7 +756,7 @@ class ChatCompletionRequest(BaseModel):
     return_hidden_states: bool = False
     return_routed_experts: bool = False
     return_cached_tokens_details: bool = False
-    reasoning_effort: Optional[Literal["none", "low", "medium", "high"]] = Field(
+    reasoning_effort: Optional[Literal["none", "low", "medium", "high", "max"]] = Field(
         default=None,
         description="Constrains effort on reasoning for reasoning models. "
         "'none' disables reasoning entirely, 'low' is the least effort, 'high' is the most effort. "
@@ -756,11 +841,40 @@ class ChatCompletionRequest(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def normalize_reasoning_inputs(cls, values: Dict):
+        _cap_chat_max_output_len(values)
+
+        unsupported = sorted(
+            key for key in _OPENAI_UNSUPPORTED_BACKEND_FIELDS if key in values
+        )
+        if unsupported:
+            raise ValueError(
+                "Unsupported OpenAI chat parameter(s): " + ", ".join(unsupported)
+            )
+
+        top_logprobs = values.get("top_logprobs")
+        if top_logprobs is not None and (top_logprobs < 0 or top_logprobs > 20):
+            raise ValueError("top_logprobs must be between 0 and 20")
+
         r = values.get("reasoning")
+        thinking = values.get("thinking")
+
+        if isinstance(thinking, dict):
+            ctk = values.get("chat_template_kwargs")
+            if not isinstance(ctk, dict):
+                ctk = {}
+            thinking_type = thinking.get("type")
+            if thinking_type == "enabled":
+                ctk.setdefault("thinking", True)
+            elif thinking_type == "disabled":
+                ctk.setdefault("thinking", False)
+                ctk.setdefault("enable_thinking", False)
+            if thinking.get("keep") == "all":
+                ctk.setdefault("preserve_thinking", True)
+            values["chat_template_kwargs"] = ctk
 
         if r is not None and isinstance(r, dict):
             effort = r.get("effort") or r.get("reasoning_effort")
-            if effort in {"none", "low", "medium", "high"}:
+            if effort in {"none", "low", "medium", "high", "max"}:
                 values["reasoning_effort"] = effort
 
             enabled = (
@@ -788,6 +902,38 @@ class ChatCompletionRequest(BaseModel):
             ctk.setdefault("enable_thinking", False)
             values["chat_template_kwargs"] = ctk
 
+        response_format = values.get("response_format")
+        structured_outputs = values.get("structured_outputs")
+        has_structured_output = bool(structured_outputs)
+        if isinstance(response_format, dict) and response_format.get("type") in {
+            "json_object",
+            "json_schema",
+        }:
+            has_structured_output = True
+        if has_structured_output:
+            ctk = values.get("chat_template_kwargs")
+            if not isinstance(ctk, dict):
+                ctk = {}
+            ctk["thinking"] = False
+            ctk["enable_thinking"] = False
+            values["chat_template_kwargs"] = ctk
+
+        return values
+
+    @model_validator(mode="before")
+    @classmethod
+    def validate_stream_options(cls, values):
+        if values.get("stream_options") is not None and not values.get("stream"):
+            raise ValueError("Stream options can only be defined when `stream=True`")
+        if values.get("stream") and values.get("prompt_logprobs") is not None:
+            raise ValueError("`prompt_logprobs` are not available when `stream=True`")
+        tool_choice = values.get("tool_choice")
+        if isinstance(tool_choice, str) and tool_choice not in {
+            "auto",
+            "required",
+            "none",
+        }:
+            raise ValueError(f"Invalid value for `tool_choice`: {tool_choice}")
         return values
 
     @model_validator(mode="before")
@@ -896,11 +1042,7 @@ class ChatCompletionRequest(BaseModel):
 
         if self.response_format and self.response_format.type == "json_schema":
             schema = _bound_json_schema(self.response_format.json_schema.schema_)
-            sampling_params["json_schema"] = (
-                json.dumps(schema)
-                if isinstance(schema, bool)
-                else convert_json_schema_to_str(schema)
-            )
+            sampling_params["json_schema"] = json.dumps(schema)
         elif self.response_format and self.response_format.type == "json_object":
             sampling_params["json_schema"] = '{"type": "object"}'
         elif self.response_format and self.response_format.type == "structural_tag":
@@ -1210,6 +1352,7 @@ class DetokenizeResponse(BaseModel):
     """Response schema for the /detokenize endpoint."""
 
     text: Union[str, List[str]]
+    prompt: Optional[Union[str, List[str]]] = None
 
 
 OpenAIServingRequest = Union[
@@ -1228,7 +1371,7 @@ OpenAIServingRequest = Union[
 class ResponseReasoningParam(BaseModel):
     """Reasoning parameters for responses."""
 
-    effort: Optional[Literal["low", "medium", "high"]] = Field(
+    effort: Optional[Literal["none", "low", "medium", "high"]] = Field(
         default="medium",
         description="Constrains effort on reasoning for reasoning models.",
     )
@@ -1237,9 +1380,14 @@ class ResponseReasoningParam(BaseModel):
 class ResponseTool(BaseModel):
     """Tool definition for responses."""
 
-    type: Literal["web_search_preview", "code_interpreter"] = Field(
+    type: Literal["function", "web_search_preview", "code_interpreter"] = Field(
         description="Type of tool to enable"
     )
+    name: Optional[str] = None
+    description: Optional[str] = None
+    parameters: Optional[dict] = None
+    strict: Optional[bool] = False
+    function: Optional[Function] = None
 
 
 ResponseInputOutputItem: TypeAlias = Union[
@@ -1279,8 +1427,11 @@ class ResponsesRequest(BaseModel):
     store: Optional[bool] = True
     stream: Optional[bool] = False
     temperature: Optional[float] = None
-    tool_choice: Literal["auto", "required", "none"] = "auto"
+    tool_choice: Union[
+        Literal["auto", "required", "none"], ToolChoice, dict
+    ] = "auto"
     tools: List[ResponseTool] = Field(default_factory=list)
+    text: Optional[dict] = None
     top_logprobs: Optional[int] = 0
     top_p: Optional[float] = None
     truncation: Optional[Literal["auto", "disabled"]] = "disabled"
@@ -1382,9 +1533,9 @@ class ResponsesResponse(BaseModel):
         Union[ResponseOutputItem, ResponseReasoningItem, ResponseFunctionToolCall]
     ] = Field(default_factory=list)
     status: Literal["queued", "in_progress", "completed", "failed", "cancelled"]
-    usage: Optional[UsageInfo] = None
+    usage: Optional[ResponseUsageInfo] = None
     parallel_tool_calls: bool = True
-    tool_choice: str = "auto"
+    tool_choice: Union[str, ToolChoice, dict] = "auto"
     tools: List[ResponseTool] = Field(default_factory=list)
 
     # OpenAI compatibility fields. not all are used at the moment.
@@ -1454,6 +1605,23 @@ class ResponsesResponse(BaseModel):
                     return False
             return True
 
+        def _responses_tools_for_output(tools: List[ResponseTool]) -> List[ResponseTool]:
+            output_tools: List[ResponseTool] = []
+            for tool in tools:
+                if tool.type != "function" or tool.function is None:
+                    output_tools.append(tool)
+                    continue
+                output_tools.append(
+                    ResponseTool(
+                        type="function",
+                        name=tool.function.name,
+                        description=tool.function.description,
+                        parameters=tool.function.parameters,
+                        strict=tool.function.strict,
+                    )
+                )
+            return output_tools
+
         text_format = {"format": {"type": "text"}} if _is_text_only(output) else None
 
         return cls(
@@ -1462,10 +1630,10 @@ class ResponsesResponse(BaseModel):
             model=model_name,
             output=output,
             status=status,
-            usage=usage,
+            usage=ResponseUsageInfo.from_usage_info(usage),
             parallel_tool_calls=request.parallel_tool_calls or True,
             tool_choice=request.tool_choice,
-            tools=request.tools,
+            tools=_responses_tools_for_output(request.tools),
             # fields for parity with v1/responses
             error=None,
             incomplete_details=None,
@@ -1473,7 +1641,11 @@ class ResponsesResponse(BaseModel):
             max_output_tokens=request.max_output_tokens,
             previous_response_id=request.previous_response_id,  # TODO(v): ensure this is propagated if retrieved from store
             reasoning={
-                "effort": request.reasoning.effort if request.reasoning else None,
+                "effort": (
+                    None
+                    if request.reasoning is None or request.reasoning.effort == "none"
+                    else request.reasoning.effort
+                ),
                 "summary": None,  # unused
             },
             store=request.store,

@@ -15,6 +15,7 @@ from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingR
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.observability.req_time_stats import monotonic_time
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils.otel_payload_logger import chatcmpl_rid_from_headers
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -70,6 +71,72 @@ class OpenAIServingBase(ABC):
         # Fall back to explicit lora_path
         return explicit_lora_path
 
+    def _observe_openai_request_metrics(
+        self, request: OpenAIServingRequest, payload: Optional[dict]
+    ) -> None:
+        if not getattr(self.tokenizer_manager, "enable_metrics", False):
+            return
+        metrics_collector = getattr(self.tokenizer_manager, "metrics_collector", None)
+        if metrics_collector is None or payload is None:
+            return
+
+        image_count = video_count = audio_count = 0
+        for message in payload.get("messages") or []:
+            if not isinstance(message, dict):
+                continue
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                part_type = part.get("type")
+                if part_type == "image_url":
+                    image_count += 1
+                elif part_type == "video_url":
+                    video_count += 1
+                elif part_type == "audio_url":
+                    audio_count += 1
+
+        tools = payload.get("tools")
+        tool_count = len(tools) if isinstance(tools, list) else 0
+        tool_choice = payload.get("tool_choice")
+        if isinstance(tool_choice, dict):
+            tool_choice = "function"
+        elif tool_choice is None:
+            tool_choice = getattr(request, "tool_choice", None)
+
+        structured_output_kind = None
+        response_format = payload.get("response_format")
+        if isinstance(response_format, dict):
+            structured_output_kind = response_format.get("type")
+        structured_outputs = payload.get("structured_outputs")
+        if structured_output_kind is None and isinstance(structured_outputs, dict):
+            for key in ("json", "json_object", "regex", "grammar", "choice"):
+                if structured_outputs.get(key) is not None:
+                    structured_output_kind = key
+                    break
+        for attr_name, kind in (("regex", "regex"), ("ebnf", "grammar")):
+            if structured_output_kind is None and payload.get(attr_name) is not None:
+                structured_output_kind = kind
+
+        metrics_collector.observe_openai_request(
+            dict(metrics_collector.labels),
+            image_count=image_count,
+            video_count=video_count,
+            audio_count=audio_count,
+            tool_count=tool_count,
+            tool_choice=str(tool_choice) if tool_choice is not None else None,
+            structured_output_kind=structured_output_kind,
+            structured_output_backend="xgrammar" if structured_output_kind else None,
+        )
+
+    def _error_log_payload(self, response: ORJSONResponse) -> dict:
+        payload = json.loads(response.body)
+        if isinstance(payload, dict) and "error" not in payload:
+            return {"error": payload}
+        return payload
+
     async def handle_request(
         self, request: OpenAIServingRequest, raw_request: Request
     ) -> Union[Any, StreamingResponse, ErrorResponse]:
@@ -77,17 +144,43 @@ class OpenAIServingBase(ABC):
         If you want to override this method, you should be careful to record the validation time.
         """
         received_time = monotonic_time()
+        request_logger = self.tokenizer_manager.request_logger
+        header_rid = chatcmpl_rid_from_headers(raw_request.headers)
+        if (
+            header_rid
+            and hasattr(request, "rid")
+            and getattr(request, "rid", None) is None
+        ):
+            request.rid = header_rid
+        raw_payload = None
+        try:
+            raw_payload = json.loads(await raw_request.body())
+        except Exception:
+            raw_payload = None
 
         try:
             # Validate request
             error_msg = self._validate_request(request)
             if error_msg:
-                return self.create_error_response(error_msg)
+                response = self.create_error_response(error_msg)
+                request_logger.log_openai_received_request(
+                    raw_payload if isinstance(raw_payload, dict) else request,
+                    request=raw_request,
+                )
+                request_logger.log_openai_response(
+                    self._error_log_payload(response),
+                    request=raw_request,
+                    rid=getattr(request, "rid", None),
+                )
+                return response
 
             # Log the raw OpenAI request payload before conversion to tokenized form.
-            request_logger = self.tokenizer_manager.request_logger
-            if request_logger.log_requests and request_logger.log_requests_level >= 2:
-                request_logger.log_openai_received_request(request, request=raw_request)
+            request_logger.log_openai_received_request(
+                raw_payload if isinstance(raw_payload, dict) else request,
+                request=raw_request,
+            )
+            if isinstance(raw_payload, dict):
+                self._observe_openai_request_metrics(request, raw_payload)
 
             # Convert to internal format
             adapted_request, processed_request = self._convert_to_internal_request(
@@ -104,33 +197,67 @@ class OpenAIServingBase(ABC):
                     adapted_request, processed_request, raw_request
                 )
             else:
-                return await self._handle_non_streaming_request(
+                response = await self._handle_non_streaming_request(
                     adapted_request, processed_request, raw_request
                 )
+                if not isinstance(response, StreamingResponse):
+                    request_logger.log_openai_response(
+                        response,
+                        request=raw_request,
+                        rid=getattr(request, "rid", None),
+                )
+                return response
         except HTTPException as e:
-            return self.create_error_response(
+            response = self.create_error_response(
                 message=e.detail, err_type=str(e.status_code), status_code=e.status_code
             )
+            request_logger.log_openai_response(
+                self._error_log_payload(response),
+                request=raw_request,
+                rid=getattr(request, "rid", None),
+            )
+            return response
         except ValueError as e:
-            return self.create_error_response(
-                message=str(e),
+            message = str(e)
+            if "grammar" in message.lower() and not message.startswith("Grammar error:"):
+                message = f"Grammar error: {message}"
+            response = self.create_error_response(
+                message=message,
                 err_type="BadRequest",
                 status_code=400,
             )
+            request_logger.log_openai_response(
+                self._error_log_payload(response),
+                request=raw_request,
+                rid=getattr(request, "rid", None),
+            )
+            return response
         except DS32EncodingError as e:
             logger.info(f"DS32EncodingError: {e}")
-            return self.create_error_response(
+            response = self.create_error_response(
                 message=str(e),
                 err_type="BadRequest",
                 status_code=400,
             )
+            request_logger.log_openai_response(
+                self._error_log_payload(response),
+                request=raw_request,
+                rid=getattr(request, "rid", None),
+            )
+            return response
         except Exception as e:
             logger.exception(f"Error in request: {e}")
-            return self.create_error_response(
+            response = self.create_error_response(
                 message=f"Internal server error: {str(e)}",
                 err_type="InternalServerError",
                 status_code=500,
             )
+            request_logger.log_openai_response(
+                self._error_log_payload(response),
+                request=raw_request,
+                rid=getattr(request, "rid", None),
+            )
+            return response
 
     @abstractmethod
     def _request_id_prefix(self) -> str:
@@ -215,6 +342,8 @@ class OpenAIServingBase(ABC):
     ) -> ORJSONResponse:
         """Create an error response"""
         # TODO: remove fastapi dependency in openai and move response handling to the entrypoint
+        if "grammar" in message.lower() and not message.startswith("Grammar error:"):
+            message = f"Grammar error: {message}"
         error = ErrorResponse(
             object="error",
             message=message,
@@ -222,7 +351,9 @@ class OpenAIServingBase(ABC):
             param=param,
             code=status_code,
         )
-        return ORJSONResponse(content=error.model_dump(), status_code=status_code)
+        return ORJSONResponse(
+            content={"error": error.model_dump()}, status_code=status_code
+        )
 
     def create_streaming_error_response(
         self,

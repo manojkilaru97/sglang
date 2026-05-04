@@ -700,6 +700,7 @@ class Scheduler(
             self.metrics_collector.emit_cache_config_info(
                 self.page_size, self.max_total_num_tokens // self.page_size
             )
+            self.metrics_collector.emit_engine_config_info()
 
     def init_cache_with_memory_pool(self):
         server_args = self.server_args

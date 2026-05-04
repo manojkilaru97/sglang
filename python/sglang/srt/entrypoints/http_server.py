@@ -19,6 +19,7 @@ This file implements HTTP APIs for the inference engine via fastapi.
 
 import asyncio
 import dataclasses
+import json
 import logging
 import os
 import tempfile
@@ -432,25 +433,28 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     else:
         message = exc_str
 
-    if request.url.path.startswith("/v1/responses"):
-        # adapt specially, for v1/responses API only (notice the error key is different)
-        nested_error = {
-            "message": message,
-            "type": HTTPStatus.BAD_REQUEST.phrase,
-            "param": None,
-            "code": HTTPStatus.BAD_REQUEST.value,
-        }
-        return ORJSONResponse(status_code=400, content={"error": nested_error})
-
     err = ErrorResponse(
         message=message,
         type=HTTPStatus.BAD_REQUEST.phrase,
         code=HTTPStatus.BAD_REQUEST.value,
     )
+    if request.url.path == "/v1/chat/completions":
+        try:
+            serving = request.app.state.openai_serving_chat
+            logger_ = serving.tokenizer_manager.request_logger
+            try:
+                payload = await request.json()
+            except Exception:
+                payload = None
+            if isinstance(payload, dict):
+                logger_.log_openai_received_request(payload, request=request)
+            logger_.log_openai_response({"error": err.model_dump()}, request=request)
+        except Exception:
+            pass
 
     return ORJSONResponse(
         status_code=400,
-        content=err.model_dump(),
+        content={"error": err.model_dump()},
     )
 
 
@@ -1396,6 +1400,29 @@ async def openai_v1_chat_completions(
 
 
 @app.post(
+    "/v1/chat/completions/render", response_class=ORJSONResponse,
+    dependencies=[Depends(validate_json_request)]
+)
+async def openai_v1_chat_completions_render(
+    request: ChatCompletionRequest, raw_request: Request
+):
+    """Render a chat completion request to prompt token ids without generating."""
+    try:
+        serving_chat = raw_request.app.state.openai_serving_chat
+        is_multimodal = serving_chat.tokenizer_manager.model_config.is_multimodal
+        processed_messages = serving_chat._process_messages(request, is_multimodal)
+        token_ids = processed_messages.prompt_ids
+        if isinstance(token_ids, str):
+            token_ids = serving_chat.tokenizer_manager.tokenizer.encode(token_ids)
+        return ORJSONResponse(
+            content={"token_ids": token_ids, "count": len(token_ids)},
+            status_code=HTTPStatus.OK,
+        )
+    except Exception as e:
+        return _create_error_response(e)
+
+
+@app.post(
     "/v1/embeddings",
     response_class=ORJSONResponse,
     dependencies=[Depends(validate_json_request)],
@@ -1565,19 +1592,106 @@ async def v1_responses_request(request: dict, raw_request: Request):
     """Endpoint for the responses API with reasoning support."""
 
     request_obj = ResponsesRequest(**request)
-    result = await raw_request.app.state.openai_serving_responses.create_responses(
-        request_obj, raw_request
+    serving = raw_request.app.state.openai_serving_responses
+    request_logger = (
+        serving.tokenizer_manager.request_logger
     )
+    request_logger.log_openai_received_request(request, request=raw_request)
+    _observe_responses_request_metrics(serving, request)
+    result = await serving.create_responses(request_obj, raw_request)
 
     # Handle streaming responses
     if isinstance(result, AsyncGenerator):
+        async def logged_stream():
+            completed_response = None
+            async for chunk in result:
+                if isinstance(chunk, str):
+                    for line in chunk.splitlines():
+                        if not line.startswith("data: "):
+                            continue
+                        data = line[6:]
+                        if data == "[DONE]":
+                            continue
+                        try:
+                            event = json.loads(data)
+                        except json.JSONDecodeError:
+                            continue
+                        if event.get("type") == "response.completed":
+                            completed_response = event.get("response")
+                yield chunk
+            if completed_response is not None:
+                request_logger.log_openai_response(
+                    completed_response,
+                    request=raw_request,
+                    rid=request_obj.request_id,
+                )
+
         return StreamingResponse(
-            result,
+            logged_stream(),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
         )
 
+    request_logger.log_openai_response(
+        result,
+        request=raw_request,
+        rid=request_obj.request_id,
+    )
     return result
+
+
+def _observe_responses_request_metrics(serving: Any, payload: dict) -> None:
+    tokenizer_manager = getattr(serving, "tokenizer_manager", None)
+    if tokenizer_manager is None or not getattr(tokenizer_manager, "enable_metrics", False):
+        return
+    metrics_collector = getattr(tokenizer_manager, "metrics_collector", None)
+    if metrics_collector is None:
+        return
+
+    image_count = video_count = audio_count = 0
+    inputs = payload.get("input")
+    if not isinstance(inputs, list):
+        inputs = []
+    for item in inputs:
+        if not isinstance(item, dict):
+            continue
+        content = item.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            part_type = part.get("type")
+            if part_type == "input_image":
+                image_count += 1
+            elif part_type == "input_video":
+                video_count += 1
+            elif part_type == "input_audio":
+                audio_count += 1
+
+    tools = payload.get("tools")
+    tool_count = len(tools) if isinstance(tools, list) else 0
+    tool_choice = payload.get("tool_choice")
+    if isinstance(tool_choice, dict):
+        tool_choice = "function"
+
+    structured_kind = None
+    text = payload.get("text")
+    if isinstance(text, dict):
+        fmt = text.get("format")
+        if isinstance(fmt, dict):
+            structured_kind = fmt.get("type")
+
+    metrics_collector.observe_openai_request(
+        dict(metrics_collector.labels),
+        image_count=image_count,
+        video_count=video_count,
+        audio_count=audio_count,
+        tool_count=tool_count,
+        tool_choice=str(tool_choice) if tool_choice is not None else None,
+        structured_output_kind=structured_kind,
+        structured_output_backend="xgrammar" if structured_kind else None,
+    )
 
 
 @app.get("/v1/responses/{response_id}")

@@ -89,6 +89,9 @@ class KimiK2Detector(BaseFormatDetector):
             if name and name.lower() in lowered_id:
                 return name, fallback_index
 
+        if len(tool_names) == 1 and function_id.startswith("functions."):
+            return next(iter(tool_names)), fallback_index
+
         return None, fallback_index
 
     def has_tool_call(self, text: str) -> bool:
@@ -115,6 +118,16 @@ class KimiK2Detector(BaseFormatDetector):
             logger.debug("function_call_tuples: %s", function_call_tuples)
 
             tool_calls = []
+            if not function_call_tuples:
+                match = self.stream_tool_call_portion_regex.search(text)
+                if match:
+                    function_id = match.group("tool_call_id")
+                    function_args = match.group("function_arguments")
+                    function_args = function_args.split(self.tool_call_end_token, 1)[0]
+                    function_args = function_args.split(self.eot_token, 1)[0].strip()
+                    if _is_complete_json(function_args):
+                        function_call_tuples = [(function_id, function_args)]
+
             for match in function_call_tuples:
                 function_id, function_args = match
                 function_name, function_idx = self._parse_tool_call_id(

@@ -19,6 +19,7 @@ from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 
 from sglang.srt.environ import envs
+from sglang.srt.utils.otel_payload_logger import get_otel_payload_logger
 from sglang.srt.utils.common import get_bool_env_var
 from sglang.srt.utils.log_utils import create_log_targets, log_json
 
@@ -136,6 +137,15 @@ class RequestLogger:
         request: Optional["fastapi.Request"] = None,
     ) -> None:
         """Log the raw OpenAI request payload before request adaptation/tokenization."""
+        rid = getattr(obj, "rid", None) or getattr(obj, "request_id", None)
+        if not rid and isinstance(obj, dict):
+            rid = obj.get("rid") or obj.get("request_id") or obj.get("id")
+        get_otel_payload_logger().emit_request(
+            obj, request.headers if request is not None else None, str(rid or "")
+        )
+        if not self.log_requests:
+            return
+
         max_length, _, _ = self.metadata
         max_length = max_length if max_length is not None else 2048
         headers = _extract_whitelisted_headers(request)
@@ -157,6 +167,16 @@ class RequestLogger:
             self._log(
                 f"Receive OpenAI: obj={_dataclass_to_string_truncated(obj_to_log, max_length)}{headers_str}"
             )
+
+    def log_openai_response(
+        self,
+        obj: Any,
+        request: Optional["fastapi.Request"] = None,
+        rid: Optional[str] = None,
+    ) -> None:
+        get_otel_payload_logger().emit_response(
+            obj, request.headers if request is not None else None, str(rid or "")
+        )
 
     def log_finished_request(
         self,
