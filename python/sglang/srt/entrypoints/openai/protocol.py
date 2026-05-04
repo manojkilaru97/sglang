@@ -52,6 +52,11 @@ from sglang.srt.environ import envs
 logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL_NAME = "default"
+TRUE_ENV_VALUES = {"1", "true", "yes", "y", "on"}
+
+
+def _env_flag_enabled(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in TRUE_ENV_VALUES
 
 
 def _configured_max_output_len() -> Optional[int]:
@@ -890,6 +895,14 @@ class ChatCompletionRequest(BaseModel):
                     ctk = {}
                 ctk.setdefault("thinking", True)
                 values["chat_template_kwargs"] = ctk
+
+        if _env_flag_enabled("SGLANG_DEFAULT_THINKING_OFF"):
+            ctk = values.get("chat_template_kwargs")
+            if not isinstance(ctk, dict):
+                ctk = {}
+            ctk.setdefault("thinking", False)
+            ctk.setdefault("enable_thinking", False)
+            values["chat_template_kwargs"] = ctk
 
         if values.get("reasoning_effort") == "none":
             ctk = values.get("chat_template_kwargs")
