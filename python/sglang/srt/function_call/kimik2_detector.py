@@ -57,12 +57,12 @@ class KimiK2Detector(BaseFormatDetector):
 
         # Support hyphenated function names (common in MCP tools, e.g. mcp__portal__search-documents)
         self.tool_call_regex = re.compile(
-            r"<\|tool_call_begin\|>\s*(?P<tool_call_id>[\w.\-]+:\d+)\s*<\|tool_call_argument_begin\|>\s*(?P<function_arguments>\{.*?\})\s*<\|tool_call_end\|>",
+            r"<\|tool_call_begin\|>\s*(?P<tool_call_id>[\w.\-]+(?::\d+)?)\s*<\|tool_call_argument_begin\|>\s*(?P<function_arguments>\{.*?\})\s*<\|tool_call_end\|>",
             re.DOTALL,
         )
 
         self.stream_tool_call_portion_regex = re.compile(
-            r"<\|tool_call_begin\|>\s*(?P<tool_call_id>[\w.\-]+:\d+)\s*<\|tool_call_argument_begin\|>\s*(?P<function_arguments>\{.*)",
+            r"<\|tool_call_begin\|>\s*(?P<tool_call_id>[\w.\-]+(?::\d+)?)\s*<\|tool_call_argument_begin\|>\s*(?P<function_arguments>\{.*)",
             re.DOTALL,
         )
 
@@ -72,6 +72,24 @@ class KimiK2Detector(BaseFormatDetector):
         self.tool_call_id_regex = re.compile(
             r"^(?:functions\.)?(?P<name>[\w.\-]+):(?P<index>\d+)$"
         )
+
+    def _parse_tool_call_id(
+        self, function_id: str, tools: List[Tool], fallback_index: int
+    ) -> tuple[str | None, int]:
+        tool_names = {tool.function.name for tool in tools if tool.function.name}
+        m = self.tool_call_id_regex.match(function_id)
+        if m:
+            name = m.group("name")
+            if name in tool_names:
+                return name, int(m.group("index"))
+
+        lowered_id = function_id.lower()
+        for tool in tools:
+            name = tool.function.name
+            if name and name.lower() in lowered_id:
+                return name, fallback_index
+
+        return None, fallback_index
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a KimiK2 format tool call."""
@@ -99,12 +117,12 @@ class KimiK2Detector(BaseFormatDetector):
             tool_calls = []
             for match in function_call_tuples:
                 function_id, function_args = match
-                m = self.tool_call_id_regex.match(function_id)
-                if not m:
+                function_name, function_idx = self._parse_tool_call_id(
+                    function_id, tools, len(tool_calls)
+                )
+                if function_name is None:
                     logger.warning("Unexpected tool_call_id format: %s", function_id)
                     continue
-                function_name = m.group("name")
-                function_idx = int(m.group("index"))
 
                 logger.debug(f"function_name {function_name}")
 
@@ -153,11 +171,12 @@ class KimiK2Detector(BaseFormatDetector):
                 function_id = match.group("tool_call_id")
                 function_args = match.group("function_arguments")
 
-                m = self.tool_call_id_regex.match(function_id)
-                if not m:
+                function_name, _ = self._parse_tool_call_id(
+                    function_id, tools, max(self.current_tool_id, 0)
+                )
+                if function_name is None:
                     logger.warning("Unexpected tool_call_id format: %s", function_id)
                     return StreamingParseResult(normal_text="", calls=calls)
-                function_name = m.group("name")
 
                 # Initialize state if this is the first tool call
                 if self.current_tool_id == -1:
@@ -184,57 +203,54 @@ class KimiK2Detector(BaseFormatDetector):
                         "name": function_name,
                         "arguments": {},
                     }
-                else:
-                    argument_diff = (
-                        function_args[len(self._last_arguments) :]
-                        if function_args.startswith(self._last_arguments)
-                        else function_args
+                argument_diff = (
+                    function_args[len(self._last_arguments) :]
+                    if function_args.startswith(self._last_arguments)
+                    else function_args
+                )
+
+                parsed_args_diff = argument_diff.split(self.tool_call_end_token, 1)[0]
+
+                if parsed_args_diff:
+                    calls.append(
+                        ToolCallItem(
+                            tool_index=self.current_tool_id,
+                            name=None,
+                            parameters=parsed_args_diff,
+                        )
                     )
+                    self._last_arguments += parsed_args_diff
+                    self.streamed_args_for_tool[
+                        self.current_tool_id
+                    ] += parsed_args_diff
 
-                    parsed_args_diff = argument_diff.split(self.tool_call_end_token, 1)[
-                        0
-                    ]
+                parsed_args = function_args.split(self.tool_call_end_token, 1)[0]
+                if _is_complete_json(parsed_args):
+                    try:
+                        parsed_args = json.loads(parsed_args)
+                        self.prev_tool_call_arr[self.current_tool_id][
+                            "arguments"
+                        ] = parsed_args
+                    except json.JSONDecodeError:
+                        pass
 
-                    if parsed_args_diff:
-                        calls.append(
-                            ToolCallItem(
-                                tool_index=self.current_tool_id,
-                                name=None,
-                                parameters=parsed_args_diff,
-                            )
-                        )
-                        self._last_arguments += parsed_args_diff
-                        self.streamed_args_for_tool[
-                            self.current_tool_id
-                        ] += parsed_args_diff
+                    # Find the end of the current tool call and remove only that part from buffer
+                    tool_call_end_pattern = (
+                        r"<\|tool_call_begin\|>.*?<\|tool_call_end\|>"
+                    )
+                    end_match = re.search(
+                        tool_call_end_pattern, current_text, re.DOTALL
+                    )
+                    if end_match:
+                        self._buffer = current_text[end_match.end() :]
+                    else:
+                        self._buffer = ""
 
-                    parsed_args = function_args.split(self.tool_call_end_token, 1)[0]
-                    if _is_complete_json(parsed_args):
-                        try:
-                            parsed_args = json.loads(parsed_args)
-                            self.prev_tool_call_arr[self.current_tool_id][
-                                "arguments"
-                            ] = parsed_args
-                        except json.JSONDecodeError:
-                            pass
-
-                        # Find the end of the current tool call and remove only that part from buffer
-                        tool_call_end_pattern = (
-                            r"<\|tool_call_begin\|>.*?<\|tool_call_end\|>"
-                        )
-                        end_match = re.search(
-                            tool_call_end_pattern, current_text, re.DOTALL
-                        )
-                        if end_match:
-                            self._buffer = current_text[end_match.end() :]
-                        else:
-                            self._buffer = ""
-
-                        result = StreamingParseResult(normal_text="", calls=calls)
-                        self.current_tool_id += 1
-                        self._last_arguments = ""
-                        self.current_tool_name_sent = False
-                        return result
+                    result = StreamingParseResult(normal_text="", calls=calls)
+                    self.current_tool_id += 1
+                    self._last_arguments = ""
+                    self.current_tool_name_sent = False
+                    return result
 
             return StreamingParseResult(normal_text="", calls=calls)
 

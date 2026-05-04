@@ -31,7 +31,10 @@ from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
 from sglang.srt.function_call.qwen25_detector import Qwen25Detector
 from sglang.srt.function_call.step3_detector import Step3Detector
 from sglang.srt.function_call.trinity_detector import TrinityDetector
-from sglang.srt.function_call.utils import get_json_schema_constraint
+from sglang.srt.function_call.utils import (
+    _bound_tool_argument_schema,
+    get_json_schema_constraint,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -144,7 +147,9 @@ class FunctionCallParser:
 
         return final_normal_text, final_calls
 
-    def get_structure_tag(self) -> LegacyStructuralTagResponseFormat:
+    def get_structure_tag(
+        self, *, force_schema: bool = False
+    ) -> LegacyStructuralTagResponseFormat:
         """
         Generate a structural tag response format for all available tools.
 
@@ -162,9 +167,15 @@ class FunctionCallParser:
 
             # accept all if not strict, otherwise only accept the schema
             is_strict = (
-                function.strict or self.tool_strict_level >= ToolStrictLevel.PARAMETER
+                force_schema
+                or function.strict
+                or self.tool_strict_level >= ToolStrictLevel.PARAMETER
             )
-            schema = function.parameters if is_strict else {}
+            schema = (
+                _bound_tool_argument_schema(function.parameters)
+                if is_strict and function.parameters
+                else {}
+            )
 
             tool_structures.append(
                 StructuresResponseFormat(
@@ -187,6 +198,7 @@ class FunctionCallParser:
         self,
         tool_choice: Union[ToolChoice, Literal["auto", "required"]],
         parallel_tool_calls: bool = True,
+        prefer_structural_tag: bool = False,
     ) -> Optional[ToolCallConstraint]:
         """
         Returns the appropriate structure constraint for tool calls based on the tool_choice.
@@ -201,6 +213,9 @@ class FunctionCallParser:
         """
         # NOTE: structural_tag only supports JSON-compatible content between the begin and end.
         # It cannot parse or validate function call Pythonic or XML-ish syntax.
+        if prefer_structural_tag and self.detector.supports_structural_tag():
+            tag = self.get_structure_tag(force_schema=True)
+            return ("structural_tag", tag)
         if (
             self.detector.supports_structural_tag()
             and tool_choice == "auto"

@@ -13,7 +13,9 @@
 # ==============================================================================
 """Pydantic models for OpenAI API protocol"""
 
+import json
 import logging
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -44,10 +46,90 @@ except:
     StructuralTag = Any
 
 from sglang.utils import convert_json_schema_to_str
+from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL_NAME = "default"
+
+
+def _bound_json_schema(schema: Any) -> Any:
+    max_length = envs.SGLANG_TOOL_ARG_STRING_MAX_LENGTH.get()
+    max_array_items = envs.SGLANG_TOOL_ARRAY_MAX_ITEMS.get()
+    max_object_properties = envs.SGLANG_TOOL_OBJECT_MAX_PROPERTIES.get()
+    if not isinstance(schema, dict):
+        return schema
+
+    capped = dict(schema)
+    schema_type = capped.get("type")
+    is_string = schema_type == "string" or (
+        isinstance(schema_type, list) and "string" in schema_type
+    )
+    is_array = schema_type == "array" or (
+        isinstance(schema_type, list) and "array" in schema_type
+    )
+    is_object = (
+        schema_type == "object"
+        or (isinstance(schema_type, list) and "object" in schema_type)
+        or isinstance(capped.get("properties"), dict)
+        or isinstance(capped.get("additionalProperties"), dict)
+    )
+
+    if is_string and max_length > 0:
+        schema_max_length = capped.get("maxLength")
+        string_max_length = (
+            min(schema_max_length, max_length)
+            if isinstance(schema_max_length, int) and schema_max_length > 0
+            else max_length
+        )
+        capped["maxLength"] = string_max_length
+        pattern = capped.get("pattern")
+        if isinstance(pattern, str):
+            if pattern.endswith("+$"):
+                capped["pattern"] = f"{pattern[:-2]}{{1,{string_max_length}}}$"
+            elif pattern.endswith("*$"):
+                capped["pattern"] = f"{pattern[:-2]}{{0,{string_max_length}}}$"
+        elif "pattern" not in capped:
+            capped["pattern"] = rf"^[\t\n\r -~]{{0,{string_max_length}}}$"
+    if is_array and max_array_items > 0 and "maxItems" not in capped:
+        capped["maxItems"] = max_array_items
+    if is_object and max_object_properties > 0:
+        object_max_properties = max_object_properties
+        properties = capped.get("properties")
+        if capped.get("additionalProperties") is False and isinstance(properties, dict):
+            object_max_properties = min(object_max_properties, len(properties))
+            capped.setdefault("propertyNames", {"enum": list(properties)})
+            required = capped.get("required")
+            if isinstance(required, list):
+                capped["minProperties"] = max(
+                    int(capped.get("minProperties", 0) or 0), len(required)
+                )
+        schema_max_properties = capped.get("maxProperties")
+        if isinstance(schema_max_properties, int) and schema_max_properties > 0:
+            object_max_properties = min(object_max_properties, schema_max_properties)
+        capped["maxProperties"] = object_max_properties
+
+    for key in ("properties", "$defs", "definitions", "patternProperties"):
+        values = capped.get(key)
+        if isinstance(values, dict):
+            capped[key] = {
+                name: _bound_json_schema(value) for name, value in values.items()
+            }
+
+    if isinstance(capped.get("items"), dict):
+        capped["items"] = _bound_json_schema(capped["items"])
+
+    if isinstance(capped.get("additionalProperties"), dict):
+        capped["additionalProperties"] = _bound_json_schema(
+            capped["additionalProperties"]
+        )
+
+    for key in ("anyOf", "oneOf", "allOf"):
+        values = capped.get(key)
+        if isinstance(values, list):
+            capped[key] = [_bound_json_schema(value) for value in values]
+
+    return capped
 
 
 class ModelCard(BaseModel):
@@ -146,7 +228,7 @@ class JsonSchemaResponseFormat(BaseModel):
     name: str
     description: Optional[str] = None
     # use alias to workaround pydantic conflict
-    schema_: Optional[Dict[str, object]] = Field(alias="schema", default=None)
+    schema_: Optional[Any] = Field(alias="schema", default=None)
     strict: Optional[bool] = False
 
 
@@ -157,7 +239,7 @@ class ResponseFormat(BaseModel):
 
 class StructuresResponseFormat(BaseModel):
     begin: str
-    schema_: Optional[Dict[str, object]] = Field(alias="schema", default=None)
+    schema_: Optional[Any] = Field(alias="schema", default=None)
     end: str
 
 
@@ -616,6 +698,7 @@ class ChatCompletionRequest(BaseModel):
     separate_reasoning: bool = True
     stream_reasoning: bool = True
     chat_template_kwargs: Optional[Dict] = None
+    structured_outputs: Optional[Dict[str, Any]] = None
 
     # SGLang multimodal tiling controls (extensions)
     max_dynamic_patch: Optional[int] = None
@@ -790,9 +873,33 @@ class ChatCompletionRequest(BaseModel):
             "spaces_between_special_tokens": spaces_between_special_tokens,
         }
 
+        if self.structured_outputs:
+            structured_outputs = self.structured_outputs
+            if structured_outputs.get("choice") is not None:
+                choices = structured_outputs["choice"]
+                if isinstance(choices, list) and choices:
+                    sampling_params["regex"] = (
+                        "(?:"
+                        + "|".join(re.escape(str(choice)) for choice in choices)
+                        + ")"
+                    )
+            elif structured_outputs.get("regex") is not None:
+                sampling_params["regex"] = structured_outputs["regex"]
+            elif structured_outputs.get("grammar") is not None:
+                sampling_params["ebnf"] = structured_outputs["grammar"]
+            elif structured_outputs.get("json") is not None:
+                sampling_params["json_schema"] = json.dumps(
+                    _bound_json_schema(structured_outputs["json"])
+                )
+            elif structured_outputs.get("json_object"):
+                sampling_params["json_schema"] = '{"type": "object"}'
+
         if self.response_format and self.response_format.type == "json_schema":
-            sampling_params["json_schema"] = convert_json_schema_to_str(
-                self.response_format.json_schema.schema_
+            schema = _bound_json_schema(self.response_format.json_schema.schema_)
+            sampling_params["json_schema"] = (
+                json.dumps(schema)
+                if isinstance(schema, bool)
+                else convert_json_schema_to_str(schema)
             )
         elif self.response_format and self.response_format.type == "json_object":
             sampling_params["json_schema"] = '{"type": "object"}'

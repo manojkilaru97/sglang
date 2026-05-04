@@ -1,5 +1,6 @@
 from json import JSONDecodeError, JSONDecoder
 from json.decoder import WHITESPACE
+import re
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 import orjson
@@ -7,6 +8,7 @@ import partial_json_parser
 from partial_json_parser.core.options import Allow
 
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
+from sglang.srt.environ import envs
 
 
 def _find_common_prefix(s1: str, s2: str) -> str:
@@ -76,14 +78,15 @@ def _get_tool_schema_defs(tools: List[Tool]) -> dict:
             continue
         defs = tool.function.parameters.get("$defs", {})
         for def_name, def_schema in defs.items():
-            if def_name in all_defs and all_defs[def_name] != def_schema:
+            bounded_def_schema = _bound_tool_argument_schema(def_schema)
+            if def_name in all_defs and all_defs[def_name] != bounded_def_schema:
                 raise ValueError(
                     f"Tool definition '{def_name}' has "
                     "multiple schemas, which is not "
                     "supported."
                 )
             else:
-                all_defs[def_name] = def_schema
+                all_defs[def_name] = bounded_def_schema
     return all_defs
 
 
@@ -92,13 +95,227 @@ def _get_tool_schema(tool: Tool) -> dict:
         "properties": {
             "name": {"type": "string", "enum": [tool.function.name]},
             "parameters": (
-                tool.function.parameters
+                _bound_tool_argument_schema(tool.function.parameters)
                 if tool.function.parameters
                 else {"type": "object", "properties": {}}
             ),
         },
         "required": ["name", "parameters"],
     }
+
+
+_LONG_TOOL_STRING_FIELDS = {
+    "body",
+    "content",
+    "message",
+    "messages",
+    "summary",
+    "text",
+}
+_DEFAULT_TOOL_ARG_STRING_MAX_LENGTH = 512
+
+
+def _tool_arg_string_max_length(field_name: Optional[str]) -> int:
+    max_length = envs.SGLANG_TOOL_ARG_STRING_MAX_LENGTH.get()
+    if max_length <= 0:
+        return max_length
+    if field_name in _LONG_TOOL_STRING_FIELDS:
+        return max_length
+    return min(max_length, _DEFAULT_TOOL_ARG_STRING_MAX_LENGTH)
+
+
+def _bound_tool_argument_schema(schema: Any, field_name: Optional[str] = None) -> Any:
+    """Prevent JSON-schema tool constraints from allowing unbounded containers."""
+    max_length = _tool_arg_string_max_length(field_name)
+    max_array_items = envs.SGLANG_TOOL_ARRAY_MAX_ITEMS.get()
+    max_object_properties = envs.SGLANG_TOOL_OBJECT_MAX_PROPERTIES.get()
+    if not isinstance(schema, dict):
+        return schema
+
+    capped = dict(schema)
+    schema_type = capped.get("type")
+
+    is_string = schema_type == "string" or (
+        isinstance(schema_type, list) and "string" in schema_type
+    )
+    is_array = schema_type == "array" or (
+        isinstance(schema_type, list) and "array" in schema_type
+    )
+    is_object = (
+        schema_type == "object"
+        or (isinstance(schema_type, list) and "object" in schema_type)
+        or isinstance(capped.get("properties"), dict)
+        or isinstance(capped.get("additionalProperties"), dict)
+    )
+
+    if is_string and max_length > 0:
+        if "maxLength" not in capped:
+            capped["maxLength"] = max_length
+        # Some constrained backends are more reliable with an explicit finite
+        # regex than maxLength alone.
+        pattern = capped.get("pattern")
+        if isinstance(pattern, str):
+            if pattern.endswith("+$"):
+                capped["pattern"] = f"{pattern[:-2]}{{1,{max_length}}}$"
+            elif pattern.endswith("*$"):
+                capped["pattern"] = f"{pattern[:-2]}{{0,{max_length}}}$"
+        elif "pattern" not in capped:
+            capped["pattern"] = rf"^[^\n]{{0,{max_length}}}$"
+    if is_array and max_array_items > 0 and "maxItems" not in capped:
+        capped["maxItems"] = max_array_items
+    if is_object and max_object_properties > 0:
+        object_max_properties = max_object_properties
+        properties = capped.get("properties")
+        if capped.get("additionalProperties") is False and isinstance(properties, dict):
+            object_max_properties = min(object_max_properties, len(properties))
+            capped.setdefault("propertyNames", {"enum": list(properties)})
+            required = capped.get("required")
+            if isinstance(required, list):
+                capped["minProperties"] = max(
+                    int(capped.get("minProperties", 0) or 0), len(required)
+                )
+        schema_max_properties = capped.get("maxProperties")
+        if isinstance(schema_max_properties, int) and schema_max_properties > 0:
+            object_max_properties = min(object_max_properties, schema_max_properties)
+        capped["maxProperties"] = object_max_properties
+    if (
+        is_object
+        and isinstance(capped.get("properties"), dict)
+        and "additionalProperties" not in capped
+    ):
+        capped["additionalProperties"] = False
+
+    for key in ("properties", "$defs", "definitions"):
+        values = capped.get(key)
+        if isinstance(values, dict):
+            capped[key] = {
+                name: _bound_tool_argument_schema(value, name)
+                for name, value in values.items()
+            }
+
+    if isinstance(capped.get("items"), dict):
+        capped["items"] = _bound_tool_argument_schema(capped["items"], field_name)
+
+    if isinstance(capped.get("additionalProperties"), dict):
+        capped["additionalProperties"] = _bound_tool_argument_schema(
+            capped["additionalProperties"], field_name
+        )
+
+    pattern_properties = capped.get("patternProperties")
+    if isinstance(pattern_properties, dict):
+        capped["patternProperties"] = {
+            name: _bound_tool_argument_schema(value, name)
+            for name, value in pattern_properties.items()
+        }
+
+    for key in ("anyOf", "oneOf", "allOf"):
+        values = capped.get(key)
+        if isinstance(values, list):
+            capped[key] = [
+                _bound_tool_argument_schema(value, field_name) for value in values
+            ]
+
+    return capped
+
+
+def _coerce_string_to_object(value: str, schema: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if not isinstance(value, str) or not isinstance(schema, dict):
+        return None
+
+    properties = schema.get("properties") or {}
+    required = schema.get("required") or []
+    if not isinstance(properties, dict) or "city" not in properties:
+        return None
+
+    parts = [part.strip() for part in value.split(",") if part.strip()]
+    if not parts:
+        return None
+
+    coerced = {"city": parts[0]}
+    if "country" in properties and len(parts) > 1:
+        coerced["country"] = ", ".join(parts[1:])
+
+    if all(key in coerced for key in required):
+        return coerced
+    return None
+
+
+def _normalize_string_to_schema_format(value: str, schema: Dict[str, Any]) -> str:
+    fmt = schema.get("format")
+    if not isinstance(fmt, str):
+        return value
+    normalized_format = fmt.strip().lower().replace("_", "-")
+    if normalized_format not in {"iso 8601", "date-time", "datetime"}:
+        return value
+
+    match = re.fullmatch(
+        r"(\d{4}-\d{2}-\d{2})[ T](\d{1,2}):(\d{2})(?::(\d{2}))?",
+        value.strip(),
+    )
+    if not match:
+        return value
+    date, hour, minute, second = match.groups()
+    return f"{date}T{int(hour):02d}:{minute}:{second or '00'}"
+
+
+def normalize_tool_arguments(
+    tool_name: Optional[str], arguments: Any, tools: List[Tool]
+) -> Any:
+    """Normalize model output to the selected tool schema when safe.
+
+    Some constrained decoders still choose the string branch of an anyOf even
+    when the prompt asks for the object branch. When the schema has an object
+    branch with familiar city/country fields and the model emitted
+    "City, Country", convert it to the requested object shape.
+    """
+    if not isinstance(arguments, dict) or not tool_name:
+        return arguments
+
+    selected_tool = next(
+        (tool for tool in tools if tool.function.name == tool_name), None
+    )
+    if selected_tool is None or not selected_tool.function.parameters:
+        return arguments
+
+    params = selected_tool.function.parameters
+    properties = params.get("properties") or {}
+    if not isinstance(properties, dict):
+        return arguments
+
+    normalized = dict(arguments)
+    for key, value in arguments.items():
+        property_schema = properties.get(key)
+        if not isinstance(property_schema, dict):
+            continue
+
+        if isinstance(value, str):
+            normalized[key] = _normalize_string_to_schema_format(
+                value, property_schema
+            )
+
+        variants = property_schema.get("anyOf") or property_schema.get("oneOf")
+        if not isinstance(variants, list):
+            continue
+
+        object_variants = [
+            variant
+            for variant in variants
+            if isinstance(variant, dict)
+            and (
+                variant.get("type") == "object"
+                or isinstance(variant.get("properties"), dict)
+            )
+        ]
+        if not object_variants or not isinstance(value, str):
+            continue
+
+        for object_schema in object_variants:
+            coerced = _coerce_string_to_object(value, object_schema)
+            if coerced is not None:
+                normalized[key] = coerced
+                break
+
+    return normalized
 
 
 def infer_type_from_json_schema(schema: Dict[str, Any]) -> Optional[str]:
@@ -219,7 +436,6 @@ def get_json_schema_constraint(
     Returns:
         JSON schema dict, or None if no valid tools found
     """
-
     if isinstance(tool_choice, ToolChoice):
         # For specific function choice, return the user's parameters schema directly
         fn_name = tool_choice.function.name
@@ -232,6 +448,12 @@ def get_json_schema_constraint(
                 }
                 if not parallel_tool_calls:
                     schema["maxItems"] = 1
+                else:
+                    max_items = get_json_schema_max_items(
+                        tools, tool_choice, parallel_tool_calls
+                    )
+                    if max_items is not None:
+                        schema["maxItems"] = max_items
                 return schema
         return None
     elif tool_choice == "required":
@@ -245,9 +467,36 @@ def get_json_schema_constraint(
         }
         if not parallel_tool_calls:
             json_schema["maxItems"] = 1
+        else:
+            max_items = get_json_schema_max_items(
+                tools, tool_choice, parallel_tool_calls
+            )
+            if max_items is not None:
+                json_schema["maxItems"] = max_items
         json_schema_defs = _get_tool_schema_defs(tools)
         if json_schema_defs:
             json_schema["$defs"] = json_schema_defs
         return json_schema
+
+    return None
+
+
+def get_json_schema_max_items(
+    tools: List[Tool],
+    tool_choice: Union[ToolChoice, Literal["required"]],
+    parallel_tool_calls: bool = True,
+) -> Optional[int]:
+    if not parallel_tool_calls:
+        return 1
+
+    if isinstance(tool_choice, ToolChoice):
+        max_named_parallel_calls = envs.SGLANG_NAMED_TOOL_MAX_PARALLEL_CALLS.get()
+        return max_named_parallel_calls if max_named_parallel_calls > 0 else None
+
+    if tool_choice == "required":
+        max_parallel_calls = envs.SGLANG_TOOL_MAX_PARALLEL_CALLS.get()
+        if max_parallel_calls <= 0:
+            return None
+        return min(max_parallel_calls, len(tools))
 
     return None

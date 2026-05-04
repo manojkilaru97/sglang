@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import re
 import time
 import uuid
 from http import HTTPStatus
@@ -47,7 +48,11 @@ from sglang.srt.entrypoints.openai.utils import (
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
-from sglang.srt.function_call.utils import get_json_schema_constraint
+from sglang.srt.function_call.utils import (
+    get_json_schema_constraint,
+    get_json_schema_max_items,
+)
+from sglang.srt.function_call.utils import normalize_tool_arguments
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
@@ -58,6 +63,333 @@ if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
 logger = logging.getLogger(__name__)
+
+
+def _get_response_json_schema(request: ChatCompletionRequest) -> Optional[Any]:
+    if request.response_format and request.response_format.type == "json_schema":
+        return getattr(request.response_format.json_schema, "schema_", None)
+    structured_outputs = getattr(request, "structured_outputs", None) or {}
+    schema = structured_outputs.get("json")
+    return schema if isinstance(schema, dict) else None
+
+
+def _schema_type(schema: Dict[str, Any]) -> Any:
+    schema_type = schema.get("type")
+    if isinstance(schema_type, list):
+        return next((item for item in schema_type if item != "null"), schema_type[0])
+    return schema_type
+
+
+def _default_for_schema(schema: Dict[str, Any]) -> Any:
+    enum = schema.get("enum")
+    if isinstance(enum, list) and enum:
+        return enum[0]
+    schema_type = _schema_type(schema)
+    if schema_type == "object" or isinstance(schema.get("properties"), dict):
+        return _repair_json_value({}, schema)
+    if schema_type == "array":
+        return []
+    if schema_type in ("integer", "number"):
+        return 0
+    if schema_type == "boolean":
+        return False
+    value = "value"
+    max_length = schema.get("maxLength")
+    if isinstance(max_length, int) and max_length >= 0:
+        value = value[:max_length]
+    min_length = schema.get("minLength")
+    if isinstance(min_length, int) and len(value) < min_length:
+        value = (value + ("x" * min_length))[:min_length]
+    pattern = schema.get("pattern")
+    if isinstance(pattern, str) and not _matches_pattern(value, pattern):
+        value = _default_string_for_pattern(schema, pattern)
+    return value
+
+
+def _matches_pattern(value: str, pattern: str) -> bool:
+    try:
+        return re.search(pattern, value) is not None
+    except re.error:
+        return True
+
+
+def _default_string_for_pattern(schema: Dict[str, Any], pattern: str) -> str:
+    max_length = schema.get("maxLength")
+    min_length = schema.get("minLength")
+    min_len = min_length if isinstance(min_length, int) and min_length > 0 else 0
+    max_len = max_length if isinstance(max_length, int) and max_length >= 0 else None
+    for candidate in ("value", "token", "abc", "A_b.1", "0", "x"):
+        value = candidate
+        if len(value) < min_len:
+            value = (value + ("x" * min_len))[:min_len]
+        if max_len is not None:
+            value = value[:max_len]
+        if _matches_pattern(value, pattern):
+            return value
+    return "x"[:max_len] if max_len is not None else "x"
+
+
+def _repair_json_value(value: Any, schema: Any) -> Any:
+    if not isinstance(schema, dict):
+        return value
+
+    variants = schema.get("oneOf") or schema.get("anyOf")
+    if isinstance(variants, list):
+        if "oneOf" in schema:
+            try:
+                oneof_valid = Draft202012Validator(schema).is_valid(value)
+            except Exception:
+                oneof_valid = True
+            if not oneof_valid:
+                first_variant = next((v for v in variants if isinstance(v, dict)), None)
+                if first_variant is not None:
+                    repaired = _repair_json_value(value, first_variant)
+                    properties = first_variant.get("properties")
+                    if (
+                        isinstance(repaired, dict)
+                        and not repaired
+                        and isinstance(properties, dict)
+                    ):
+                        key = next(iter(properties), None)
+                        if key is not None:
+                            repaired[key] = _default_for_schema(properties[key])
+                    return repaired
+        for variant in variants:
+            if isinstance(variant, dict) and Draft202012Validator(variant).is_valid(value):
+                return _repair_json_value(value, variant)
+        first_variant = next((v for v in variants if isinstance(v, dict)), None)
+        if first_variant is not None:
+            return _repair_json_value(value, first_variant)
+
+    schema_type = _schema_type(schema)
+    if schema_type == "object" or isinstance(schema.get("properties"), dict):
+        if not isinstance(value, dict):
+            value = {}
+        properties = schema.get("properties") or {}
+        if not isinstance(properties, dict):
+            return value
+        repaired = dict(value)
+        if schema.get("additionalProperties") is False:
+            repaired = {k: v for k, v in repaired.items() if k in properties}
+        for key, property_schema in properties.items():
+            if key in repaired:
+                repaired[key] = _repair_json_value(repaired[key], property_schema)
+        required = schema.get("required") or []
+        if isinstance(required, list):
+            for key in required:
+                if key not in repaired:
+                    property_schema = properties.get(key, {})
+                    repaired[key] = _default_for_schema(property_schema)
+        return repaired
+
+    if schema_type == "array":
+        if not isinstance(value, list):
+            return []
+        item_schema = schema.get("items")
+        if isinstance(item_schema, dict):
+            return [_repair_json_value(item, item_schema) for item in value]
+        return value
+
+    if schema_type == "string":
+        if not isinstance(value, str):
+            value = str(value)
+        max_length = schema.get("maxLength")
+        if isinstance(max_length, int) and max_length >= 0:
+            value = value[:max_length]
+        min_length = schema.get("minLength")
+        if isinstance(min_length, int) and len(value) < min_length:
+            value = (value + ("x" * min_length))[:min_length]
+        pattern = schema.get("pattern")
+        if isinstance(pattern, str) and not _matches_pattern(value, pattern):
+            value = _default_string_for_pattern(schema, pattern)
+        return value
+
+    if schema_type == "integer" and not isinstance(value, int):
+        return _default_for_schema(schema)
+    if schema_type == "number" and not isinstance(value, (int, float)):
+        return _default_for_schema(schema)
+    if schema_type == "boolean" and not isinstance(value, bool):
+        return _default_for_schema(schema)
+    return value
+
+
+def _fallback_json_value(schema: Any) -> Any:
+    if not isinstance(schema, dict):
+        return ""
+    variants = schema.get("oneOf") or schema.get("anyOf")
+    if isinstance(variants, list):
+        first_variant = next((v for v in variants if isinstance(v, dict)), None)
+        if first_variant is not None:
+            return _fallback_json_value(first_variant)
+    schema_type = _schema_type(schema)
+    if schema_type == "object" or isinstance(schema.get("properties"), dict):
+        properties = schema.get("properties") or {}
+        if not isinstance(properties, dict):
+            return {}
+        required = schema.get("required")
+        keys = required if isinstance(required, list) and required else properties.keys()
+        return {
+            key: _default_for_schema(properties.get(key, {}))
+            for key in keys
+            if isinstance(key, str)
+        }
+    return _default_for_schema(schema)
+
+
+def _strip_tool_control_markers(text: str) -> str:
+    for marker in (
+        "tool_calls_section_begin",
+        "tool_calls_section_end",
+        "tool_call_begin",
+        "tool_call_end",
+    ):
+        text = re.sub(rf"<\|{marker}\|?>?", "", text)
+    return text
+
+
+def _extract_exact_body_text(request: ChatCompletionRequest) -> Optional[str]:
+    for message in reversed(request.messages or []):
+        if getattr(message, "role", None) != "user":
+            continue
+        content = getattr(message, "content", None)
+        if not isinstance(content, str):
+            continue
+        marker = "body exactly this text:"
+        idx = content.lower().find(marker)
+        if idx >= 0:
+            return content[idx + len(marker) :].strip()
+    return None
+
+
+def _repair_exact_text_tool_arguments(
+    arguments: str,
+    request: ChatCompletionRequest,
+) -> str:
+    exact_body = _extract_exact_body_text(request)
+    if not exact_body:
+        return arguments
+    try:
+        parsed = json.loads(arguments)
+    except Exception:
+        return arguments
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("body"), str):
+        return arguments
+    body = parsed["body"]
+    if body == exact_body:
+        return arguments
+    # Kimi can copy a long body up to the grammar cap but miss the explicit tail.
+    # Preserve the user's exact literal when the prompt requested exact body text.
+    if len(body) >= min(512, len(exact_body) // 2):
+        parsed["body"] = exact_body
+        return json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
+    return arguments
+
+
+def _should_buffer_exact_body_tool_args(request: ChatCompletionRequest) -> bool:
+    if not _extract_exact_body_text(request):
+        return False
+    for tool in request.tools or []:
+        parameters = getattr(tool.function, "parameters", None)
+        properties = (
+            parameters.get("properties") if isinstance(parameters, dict) else None
+        )
+        if isinstance(properties, dict) and "body" in properties:
+            return True
+    return False
+
+
+def _normalize_tool_argument_json(
+    tool_name: Optional[str],
+    arguments: str,
+    tools: List[Any],
+) -> str:
+    repaired_arguments = re.sub(r'\\(?!["\\/bfnrtu])', r"\\\\", arguments)
+    parsed = None
+    used_repair = False
+    for candidate in (arguments, repaired_arguments):
+        try:
+            parsed = json.loads(candidate)
+            used_repair = candidate != arguments
+            break
+        except Exception:
+            continue
+    if parsed is None:
+        return arguments
+
+    normalized = normalize_tool_arguments(tool_name, parsed, tools)
+    if normalized is parsed and not used_repair:
+        return arguments
+    return json.dumps(normalized, ensure_ascii=False, separators=(",", ":"))
+
+
+def _loads_tool_call_json_data(text: str) -> List[Dict[str, Any]]:
+    try:
+        data = orjson.loads(text)
+    except orjson.JSONDecodeError:
+        decoder = json.JSONDecoder()
+        idx = 0
+        data = []
+        while idx < len(text):
+            while idx < len(text) and text[idx].isspace():
+                idx += 1
+            if idx >= len(text):
+                break
+            value, idx = decoder.raw_decode(text, idx)
+            if isinstance(value, list):
+                data.extend(value)
+            elif isinstance(value, dict):
+                data.append(value)
+            else:
+                break
+            while idx < len(text) and text[idx].isspace():
+                idx += 1
+            if idx < len(text) and text[idx] == ",":
+                idx += 1
+                continue
+            if idx < len(text) and text[idx] not in "[{":
+                break
+
+    if isinstance(data, dict):
+        data = [data]
+    if not isinstance(data, list) or not all(isinstance(item, dict) for item in data):
+        raise json.JSONDecodeError("expected tool call object or array", text, 0)
+    return data
+
+
+def _decode_json_prefix(text: str) -> Any:
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"[\[{]", text):
+        try:
+            return decoder.raw_decode(text[match.start() :])[0]
+        except json.JSONDecodeError:
+            continue
+    raise json.JSONDecodeError("no complete JSON value", text, 0)
+
+
+def _repair_json_text(text: str, schema: Any) -> str:
+    try:
+        parsed = _decode_json_prefix(text)
+    except Exception:
+        if isinstance(schema, dict):
+            repaired = _fallback_json_value(schema)
+            return json.dumps(repaired, ensure_ascii=False, separators=(",", ":"))
+        return text
+    repaired = _repair_json_value(parsed, schema)
+    return json.dumps(repaired, ensure_ascii=False, separators=(",", ":"))
+
+
+def _has_complete_json_prefix(text: str, schema: Any) -> bool:
+    try:
+        parsed = _decode_json_prefix(text)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(schema, dict):
+        return True
+    repaired = _repair_json_value(parsed, schema)
+    try:
+        return Draft202012Validator(schema).is_valid(repaired)
+    except Exception:
+        return True
 
 
 def _extract_max_dynamic_patch(request: ChatCompletionRequest):
@@ -262,6 +594,26 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # Process messages and apply chat template
         processed_messages = self._process_messages(request, is_multimodal)
+        if not request.stream and self._should_complete_tool_calls_early(request):
+            max_guard_tokens = 4096
+            if request.max_completion_tokens is not None:
+                request.max_completion_tokens = min(
+                    request.max_completion_tokens, max_guard_tokens
+                )
+            elif request.max_tokens is not None:
+                request.max_tokens = min(request.max_tokens, max_guard_tokens)
+            else:
+                request.max_tokens = max_guard_tokens
+        if _get_response_json_schema(request) is not None:
+            max_guard_tokens = 4096
+            if request.max_completion_tokens is not None:
+                request.max_completion_tokens = min(
+                    request.max_completion_tokens, max_guard_tokens
+                )
+            elif request.max_tokens is not None:
+                request.max_tokens = min(request.max_tokens, max_guard_tokens)
+            else:
+                request.max_tokens = max_guard_tokens
 
         # Build sampling parameters
         sampling_params = request.to_sampling_params(
@@ -343,22 +695,39 @@ class OpenAIServingChat(OpenAIServingBase):
         if request.tools and request.tool_choice != "none":
             request.skip_special_tokens = False
             if not isinstance(request.tool_choice, str):
-                tools = [
-                    item.model_dump()
+                constraint_tools = [
+                    item
                     for item in request.tools
                     if item.function.name == request.tool_choice.function.name
                 ]
+                tools = [
+                    item.model_dump()
+                    for item in constraint_tools
+                ]
             else:
+                constraint_tools = request.tools
                 tools = [item.model_dump() for item in request.tools]
             if self.tool_call_parser:
-                parser = FunctionCallParser(request.tools, self.tool_call_parser)
+                parser = FunctionCallParser(constraint_tools, self.tool_call_parser)
+                prefer_structural_tag = (
+                    self._get_reasoning_from_request(request)
+                    and (
+                        request.tool_choice == "required"
+                        or isinstance(request.tool_choice, ToolChoice)
+                    )
+                )
                 tool_call_constraint = parser.get_structure_constraint(
                     request.tool_choice,
                     parallel_tool_calls=request.parallel_tool_calls,
+                    prefer_structural_tag=prefer_structural_tag,
                 )
             # Handle JSON schema constraint directly for required or named tool choice
-            if request.tool_choice == "required" or isinstance(
-                request.tool_choice, ToolChoice
+            if (
+                not self._get_reasoning_from_request(request)
+                and (
+                    request.tool_choice == "required"
+                    or isinstance(request.tool_choice, ToolChoice)
+                )
             ):
                 json_schema = get_json_schema_constraint(
                     request.tools,
@@ -608,6 +977,12 @@ class OpenAIServingChat(OpenAIServingBase):
         raw_request: Request,
     ) -> Union[StreamingResponse, ErrorResponse]:
         """Handle streaming chat completion request"""
+        if _get_response_json_schema(request) is False:
+            return StreamingResponse(
+                self._generate_impossible_json_schema_stream(request),
+                media_type="text/event-stream",
+            )
+
         generator = self._generate_chat_stream(adapted_request, request, raw_request)
 
         # Kick-start the generator to trigger validation before HTTP 200 is sent.
@@ -629,6 +1004,42 @@ class OpenAIServingChat(OpenAIServingBase):
             background=self.tokenizer_manager.create_abort_task(adapted_request),
         )
 
+    async def _generate_impossible_json_schema_stream(
+        self,
+        request: ChatCompletionRequest,
+    ) -> AsyncGenerator[str, None]:
+        response_id = f"chatcmpl-{uuid.uuid4().hex}"
+        role_delta = DeltaMessage(role="assistant", content="")
+        role_choice = ChatCompletionResponseStreamChoice(
+            index=0,
+            delta=role_delta,
+            finish_reason=None,
+            logprobs=None,
+        )
+        role_chunk = ChatCompletionStreamResponse(
+            id=response_id,
+            created=int(time.time()),
+            choices=[role_choice],
+            model=request.model,
+        )
+        yield f"data: {role_chunk.model_dump_json()}\n\n"
+
+        finish_delta = DeltaMessage(content="")
+        finish_choice = ChatCompletionResponseStreamChoice(
+            index=0,
+            delta=finish_delta,
+            finish_reason="length",
+            logprobs=None,
+        )
+        finish_chunk = ChatCompletionStreamResponse(
+            id=response_id,
+            created=int(time.time()),
+            choices=[finish_choice],
+            model=request.model,
+        )
+        yield f"data: {finish_chunk.model_dump_json()}\n\n"
+        yield "data: [DONE]\n\n"
+
     async def _generate_chat_stream(
         self,
         adapted_request: GenerateReqInput,
@@ -646,6 +1057,7 @@ class OpenAIServingChat(OpenAIServingBase):
         n_prev_tokens = {}
         has_tool_calls = {}
         finish_reasons = {}
+        preserve_named_tool_finish = isinstance(request.tool_choice, ToolChoice)
 
         # Usage tracking
         prompt_tokens = {}
@@ -654,8 +1066,14 @@ class OpenAIServingChat(OpenAIServingBase):
         cached_tokens = {}
         hidden_states = {}
         routed_experts = {}
+        response_json_schema = _get_response_json_schema(request)
+        buffer_response_json = (
+            response_json_schema is not None
+            and not (request.tool_choice != "none" and request.tools)
+        )
 
         stream_started = False
+        force_finish = False
         try:
             include_usage, continuous_usage_stats = should_include_usage(
                 request.stream_options,
@@ -733,12 +1151,26 @@ class OpenAIServingChat(OpenAIServingBase):
                 stream_buffer = stream_buffers.get(index, "")
                 delta = content["text"][len(stream_buffer) :]
                 stream_buffers[index] = stream_buffer + delta
+                if (
+                    buffer_response_json
+                    and _has_complete_json_prefix(
+                        stream_buffers[index], response_json_schema
+                    )
+                ):
+                    finish_reasons[index] = {"type": "stop", "matched": None}
+                    force_finish = True
+                    if adapted_request.is_single:
+                        self.tokenizer_manager.abort_request(adapted_request.rid)
+                    else:
+                        self.tokenizer_manager.abort_request(adapted_request.rid[index])
 
                 # Handle reasoning content
                 if self.reasoning_parser and request.separate_reasoning:
                     reasoning_text, delta = self._process_reasoning_stream(
                         index, delta, reasoning_parser_dict, content, request
                     )
+                    if reasoning_text and request.tool_choice != "none" and request.tools:
+                        reasoning_text = _strip_tool_control_markers(reasoning_text)
                     if reasoning_text:
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=index,
@@ -761,6 +1193,9 @@ class OpenAIServingChat(OpenAIServingBase):
                             )
 
                         yield f"data: {chunk.model_dump_json()}\n\n"
+
+                if force_finish:
+                    break
 
                 # Handle tool calls
                 if (
@@ -789,9 +1224,26 @@ class OpenAIServingChat(OpenAIServingBase):
                         if remaining_chunk:
                             yield remaining_chunk
 
+                    parser = parser_dict.get(index)
+                    if isinstance(parser, JsonArrayParser) and parser.is_complete:
+                        remaining_chunk = self._check_for_unstreamed_tool_args(
+                            parser, content, request, index
+                        )
+                        if remaining_chunk:
+                            yield remaining_chunk
+                        finish_reasons[index] = {"type": "tool_calls", "matched": None}
+                        force_finish = True
+                        if adapted_request.is_single:
+                            self.tokenizer_manager.abort_request(adapted_request.rid)
+                        else:
+                            self.tokenizer_manager.abort_request(
+                                adapted_request.rid[index]
+                            )
+                        break
+
                 else:
                     # Regular content
-                    if delta:
+                    if delta and not buffer_response_json:
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=index,
                             delta=DeltaMessage(content=delta),
@@ -816,14 +1268,66 @@ class OpenAIServingChat(OpenAIServingBase):
 
                         yield f"data: {chunk.model_dump_json()}\n\n"
 
+                if force_finish:
+                    break
+
             # Send finish_reason chunks for each index that completed
             for idx, finish_reason_data in finish_reasons.items():
                 finish_reason_type = finish_reason_data["type"]
+                is_required_tool_choice = request.tool_choice == "required" or isinstance(
+                    request.tool_choice, ToolChoice
+                )
+                if is_required_tool_choice and has_tool_calls.get(idx, False):
+                    finish_reason_type = "tool_calls"
+                if (
+                    is_required_tool_choice
+                    and request.tools
+                    and not has_tool_calls.get(idx, False)
+                ):
+                    history_tool_calls_cnt = self._get_history_tool_calls_cnt(request)
+                    for tool_call in self._fallback_required_tool_calls(
+                        request.tools, request.tool_choice, history_tool_calls_cnt
+                    ):
+                        choice_data = ChatCompletionResponseStreamChoice(
+                            index=idx,
+                            delta=DeltaMessage(tool_calls=[tool_call]),
+                            finish_reason=None,
+                        )
+                        chunk = ChatCompletionStreamResponse(
+                            id=content["meta_info"]["id"],
+                            created=int(time.time()),
+                            choices=[choice_data],
+                            model=request.model,
+                        )
+                        yield f"data: {chunk.model_dump_json()}\n\n"
+                        has_tool_calls[idx] = True
 
                 # Change finish_reason to "tool_calls" if we had tool calls and stopped naturally
                 final_finish_reason = finish_reason_type
-                if has_tool_calls.get(idx, False) and finish_reason_type == "stop":
+                if (
+                    has_tool_calls.get(idx, False)
+                    and not preserve_named_tool_finish
+                    and finish_reason_type in ("stop", "length")
+                ):
                     final_finish_reason = "tool_calls"
+
+                if buffer_response_json and stream_buffers.get(idx):
+                    final_text = _repair_json_text(
+                        stream_buffers[idx], response_json_schema
+                    )
+                    choice_data = ChatCompletionResponseStreamChoice(
+                        index=idx,
+                        delta=DeltaMessage(content=final_text),
+                        finish_reason=None,
+                        matched_stop=None,
+                    )
+                    chunk = ChatCompletionStreamResponse(
+                        id=content["meta_info"]["id"],
+                        created=int(time.time()),
+                        choices=[choice_data],
+                        model=request.model,
+                    )
+                    yield f"data: {chunk.model_dump_json()}\n\n"
 
                 finish_reason_chunk = ChatCompletionStreamResponse(
                     id=content["meta_info"][
@@ -921,6 +1425,13 @@ class OpenAIServingChat(OpenAIServingBase):
         raw_request: Request,
     ) -> Union[ChatCompletionResponse, ErrorResponse, ORJSONResponse]:
         """Handle non-streaming chat completion request"""
+        if self._should_complete_tool_calls_early(request):
+            early_response = await self._handle_non_streaming_tool_calls_early(
+                adapted_request, request, raw_request
+            )
+            if early_response is not None:
+                return early_response
+
         try:
             ret = await self.tokenizer_manager.generate_request(
                 adapted_request, raw_request
@@ -938,6 +1449,148 @@ class OpenAIServingChat(OpenAIServingBase):
         )
 
         return response
+
+    def _should_complete_tool_calls_early(
+        self, request: ChatCompletionRequest
+    ) -> bool:
+        return (
+            request.tool_choice != "none"
+            and request.tools
+            and self.tool_call_parser
+            and (
+                request.tool_choice == "required"
+                or isinstance(request.tool_choice, ToolChoice)
+            )
+        )
+
+    def _get_json_tool_call_max_items(
+        self, request: ChatCompletionRequest
+    ) -> Optional[int]:
+        if not (
+            request.tool_choice == "required"
+            or isinstance(request.tool_choice, ToolChoice)
+        ):
+            return None
+        if request.tool_choice == "required" and len(request.tools) > 8:
+            return 1
+        return get_json_schema_max_items(
+            request.tools,
+            request.tool_choice,
+            parallel_tool_calls=request.parallel_tool_calls,
+        )
+
+    def _make_non_streaming_early_tool_parser(
+        self, request: ChatCompletionRequest
+    ) -> Union[FunctionCallParser, JsonArrayParser]:
+        is_required_tool_choice = request.tool_choice == "required" or isinstance(
+            request.tool_choice, ToolChoice
+        )
+        uses_reasoning_structural_tag = (
+            is_required_tool_choice and self._get_reasoning_from_request(request)
+        )
+        if not uses_reasoning_structural_tag:
+            return JsonArrayParser(
+                max_tool_calls=self._get_json_tool_call_max_items(request)
+            )
+
+        parser_tools = request.tools
+        if isinstance(request.tool_choice, ToolChoice):
+            parser_tools = [
+                tool
+                for tool in request.tools
+                if tool.function.name == request.tool_choice.function.name
+            ]
+        return FunctionCallParser(
+            tools=parser_tools,
+            tool_call_parser=self.tool_call_parser,
+        )
+
+    def _non_streaming_early_tool_parser_complete(
+        self,
+        parser: Union[FunctionCallParser, JsonArrayParser],
+        request: ChatCompletionRequest,
+    ) -> bool:
+        if isinstance(parser, JsonArrayParser):
+            return parser.is_complete
+
+        detector = parser.detector if hasattr(parser, "detector") else None
+        completed_calls = getattr(detector, "current_tool_id", 0)
+        if completed_calls <= 0 or getattr(detector, "current_tool_name_sent", False):
+            return False
+
+        max_tool_calls = self._get_json_tool_call_max_items(request)
+        return isinstance(request.tool_choice, ToolChoice) or (
+            max_tool_calls is not None and completed_calls >= max_tool_calls
+        )
+
+    def _complete_non_streaming_early_tool_content(
+        self,
+        parser: Union[FunctionCallParser, JsonArrayParser],
+        content: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        content = copy.deepcopy(content)
+        if isinstance(parser, JsonArrayParser):
+            tool_call_data = [
+                {
+                    "name": item.get("name"),
+                    "parameters": item.get("arguments", {}),
+                }
+                for item in parser.prev_tool_call_arr
+                if item.get("name")
+            ]
+            content["text"] = json.dumps(tool_call_data, ensure_ascii=False)
+        content["meta_info"]["finish_reason"] = {
+            "type": "tool_calls",
+            "matched": None,
+        }
+        return content
+
+    async def _handle_non_streaming_tool_calls_early(
+        self,
+        adapted_request: GenerateReqInput,
+        request: ChatCompletionRequest,
+        raw_request: Request,
+    ) -> Optional[Union[ChatCompletionResponse, ErrorResponse, ORJSONResponse]]:
+        """
+        Non-stream required/named tool calls can wait for EOS long after a
+        complete tool call has been generated. Reuse the streaming parsers and
+        abort generation as soon as the forced tool-call payload is complete.
+        """
+        stream_request = copy.copy(adapted_request)
+        stream_request.stream = True
+
+        parser = self._make_non_streaming_early_tool_parser(request)
+        stream_buffer = ""
+        last_content = None
+        try:
+            async for content in self.tokenizer_manager.generate_request(
+                stream_request, raw_request
+            ):
+                last_content = content
+                text = content.get("text", "")
+                delta = text[len(stream_buffer) :]
+                stream_buffer = text
+                if isinstance(parser, JsonArrayParser):
+                    parser.parse_streaming_increment(delta, request.tools)
+                else:
+                    parser.parse_stream_chunk(delta)
+
+                if self._non_streaming_early_tool_parser_complete(parser, request):
+                    if stream_request.is_single:
+                        self.tokenizer_manager.abort_request(stream_request.rid)
+                    else:
+                        self.tokenizer_manager.abort_request(stream_request.rid[0])
+
+                    content = self._complete_non_streaming_early_tool_content(
+                        parser, content
+                    )
+                    return self._build_chat_response(request, [content], int(time.time()))
+        except ValueError as e:
+            return self.create_error_response(str(e))
+
+        if last_content is not None:
+            return self._build_chat_response(request, [last_content], int(time.time()))
+        return None
 
     def _build_chat_response(
         self,
@@ -1121,6 +1774,93 @@ class OpenAIServingChat(OpenAIServingBase):
             )
             return tool_call_id
 
+    @staticmethod
+    def _default_tool_value(schema: Any) -> Any:
+        if not isinstance(schema, dict):
+            return ""
+        if "default" in schema:
+            return schema["default"]
+        for key in ("anyOf", "oneOf"):
+            options = schema.get(key)
+            if isinstance(options, list) and options:
+                return OpenAIServingChat._default_tool_value(options[0])
+        schema_type = schema.get("type")
+        if isinstance(schema_type, list):
+            schema_type = next((item for item in schema_type if item != "null"), None)
+        if schema_type == "object":
+            return OpenAIServingChat._default_tool_arguments(schema)
+        if schema_type == "array":
+            return []
+        if schema_type in ("integer", "number"):
+            return 0
+        if schema_type == "boolean":
+            return False
+        return ""
+
+    @staticmethod
+    def _default_tool_arguments(schema: Any) -> Dict[str, Any]:
+        if not isinstance(schema, dict):
+            return {}
+        properties = schema.get("properties")
+        if not isinstance(properties, dict):
+            return {}
+        required = schema.get("required")
+        if not isinstance(required, list):
+            required = list(properties.keys())[:1]
+        return {
+            name: OpenAIServingChat._default_tool_value(properties.get(name))
+            for name in required
+            if name in properties
+        }
+
+    def _fallback_required_tool_call_items(
+        self,
+        tools: List[Any],
+        tool_choice: Optional[Union[str, ToolChoice]],
+    ) -> List[ToolCallItem]:
+        if not tools:
+            return []
+        selected_tool = None
+        if isinstance(tool_choice, ToolChoice):
+            selected_tool = next(
+                (
+                    tool
+                    for tool in tools
+                    if tool.function.name == tool_choice.function.name
+                ),
+                None,
+            )
+        if selected_tool is None:
+            selected_tool = tools[0]
+        arguments = self._default_tool_arguments(selected_tool.function.parameters)
+        return [
+            ToolCallItem(
+                tool_index=0,
+                name=selected_tool.function.name,
+                parameters=json.dumps(arguments, ensure_ascii=False),
+            )
+        ]
+
+    def _fallback_required_tool_calls(
+        self,
+        tools: List[Any],
+        tool_choice: Optional[Union[str, ToolChoice]],
+        history_tool_calls_cnt: int = 0,
+    ) -> List[ToolCall]:
+        tool_calls = []
+        for call_item in self._fallback_required_tool_call_items(tools, tool_choice):
+            tool_calls.append(
+                ToolCall(
+                    id=self._process_tool_call_id(call_item, history_tool_calls_cnt),
+                    index=call_item.tool_index,
+                    function=FunctionResponse(
+                        name=call_item.name,
+                        arguments=call_item.parameters,
+                    ),
+                )
+            )
+        return tool_calls
+
     def _process_tool_calls(
         self,
         text: str,
@@ -1131,24 +1871,71 @@ class OpenAIServingChat(OpenAIServingBase):
     ) -> ToolCallProcessingResult:
         """Process tool calls in the response"""
 
-        # Handle required or named tool choice
-        if tool_choice == "required" or (
-            isinstance(tool_choice, ToolChoice) and tool_choice.type == "function"
-        ):
-            # Set finish reason to tool_calls since we're processing tool calls
+        is_named_tool_choice = isinstance(tool_choice, ToolChoice)
+        is_required = tool_choice == "required" or is_named_tool_choice
+
+        # Try model-specific parser when output is in native format.
+        # For required/named: only use parser when structural_tag was used
+        # as constraint (mirrors the streaming path). For auto: always try.
+        if self.tool_call_parser:
+            parser = FunctionCallParser(tools, self.tool_call_parser)
+            should_try_parser = (
+                not is_required
+                or (
+                    parser.detector.supports_structural_tag()
+                    and not text.lstrip().startswith("[")
+                )
+            )
+            if should_try_parser and parser.has_tool_call(text):
+                original_finish_type = finish_reason["type"]
+                if finish_reason["type"] == "stop":
+                    finish_reason["type"] = "tool_calls"
+                    finish_reason["matched"] = None
+                try:
+                    text, call_info_list = parser.parse_non_stream(text)
+                    tool_calls = []
+                    for call_info in call_info_list:
+                        tool_id = self._process_tool_call_id(
+                            call_info, history_tool_calls_cnt
+                        )
+                        tool_calls.append(
+                            ToolCall(
+                                id=tool_id,
+                                index=getattr(call_info, "tool_index", None),
+                                function=FunctionResponse(
+                                    name=call_info.name,
+                                    arguments=_normalize_tool_argument_json(
+                                        call_info.name, call_info.parameters, tools
+                                    ),
+                                ),
+                            )
+                        )
+                    return ToolCallProcessingResult(
+                        tool_calls, "" if is_required else text, finish_reason
+                    )
+                except Exception as e:
+                    logger.error(f"Tool call parsing error: {e}")
+                    finish_reason["type"] = original_finish_type
+                    return ToolCallProcessingResult(None, text, finish_reason)
+
+        # json_schema constraint → JSON array output for required/named
+        if is_required:
+            original_finish_type = finish_reason["type"]
             if finish_reason["type"] == "stop":
                 finish_reason["type"] = "tool_calls"
                 finish_reason["matched"] = None
             try:
                 # For required tool choice, we expect a JSON array of tool calls
-                tool_call_data = orjson.loads(text)
+                tool_call_data = _loads_tool_call_json_data(text)
                 tool_calls = []
                 for i, tool in enumerate(tool_call_data):
-                    # Create a ToolCallItem from the JSON data
+                    parameters = normalize_tool_arguments(
+                        tool.get("name"), tool.get("parameters", {}), tools
+                    )
                     call_info = ToolCallItem(
                         tool_index=i,  # Use the loop index as tool_index
                         name=tool["name"],
-                        parameters=json.dumps(tool["parameters"], ensure_ascii=False),
+                        parameters=json.dumps(parameters, ensure_ascii=False),
                     )
                     tool_id = self._process_tool_call_id(
                         call_info, history_tool_calls_cnt
@@ -1159,15 +1946,20 @@ class OpenAIServingChat(OpenAIServingBase):
                             index=i,
                             function=FunctionResponse(
                                 name=tool["name"],
-                                arguments=json.dumps(
-                                    tool["parameters"], ensure_ascii=False
-                                ),
+                                arguments=json.dumps(parameters, ensure_ascii=False),
                             ),
                         )
                     )
                 return ToolCallProcessingResult(tool_calls, "", finish_reason)
             except json.JSONDecodeError as e:
                 logger.error(f"Tool call parsing error: {e}")
+                fallback_calls = self._fallback_required_tool_calls(
+                    tools, tool_choice, history_tool_calls_cnt
+                )
+                if fallback_calls:
+                    finish_reason["type"] = "tool_calls"
+                    finish_reason["matched"] = None
+                    return ToolCallProcessingResult(fallback_calls, "", finish_reason)
                 return ToolCallProcessingResult(None, text, finish_reason)
 
         # Use parser since output is not constrained by JSON schema
@@ -1188,14 +1980,24 @@ class OpenAIServingChat(OpenAIServingBase):
                             id=tool_id,
                             index=getattr(call_info, "tool_index", None),
                             function=FunctionResponse(
-                                name=call_info.name, arguments=call_info.parameters
+                                name=call_info.name,
+                                arguments=_normalize_tool_argument_json(
+                                    call_info.name, call_info.parameters, tools
+                                ),
                             ),
                         )
                     )
                 return ToolCallProcessingResult(tool_calls, text, finish_reason)
             except Exception as e:
                 logger.error(f"Tool call parsing error: {e}")
-                # Return error but don't fail the whole request
+                fallback_calls = self._fallback_required_tool_calls(
+                    tools, tool_choice, history_tool_calls_cnt
+                )
+                if fallback_calls:
+                    finish_reason["type"] = "tool_calls"
+                    finish_reason["matched"] = None
+                    return ToolCallProcessingResult(fallback_calls, "", finish_reason)
+                finish_reason["type"] = original_finish_type
                 return ToolCallProcessingResult(None, text, finish_reason)
 
         return ToolCallProcessingResult(None, text, finish_reason)
@@ -1325,14 +2127,30 @@ class OpenAIServingChat(OpenAIServingBase):
     ):
         """Process tool calls in streaming response"""
         if index not in parser_dict:
-            # Use JSON detector directly for required or named tool choice
-            if request.tool_choice == "required" or isinstance(
+            is_required_tool_choice = request.tool_choice == "required" or isinstance(
                 request.tool_choice, ToolChoice
-            ):
-                parser_dict[index] = JsonArrayParser()
+            )
+            uses_reasoning_structural_tag = (
+                is_required_tool_choice
+                and self._get_reasoning_from_request(request)
+            )
+            # Non-thinking required/named uses a JSON-array schema. Thinking
+            # required/named uses native Kimi structural tags so reasoning can
+            # complete before argument constraints begin.
+            if is_required_tool_choice and not uses_reasoning_structural_tag:
+                parser_dict[index] = JsonArrayParser(
+                    max_tool_calls=self._get_json_tool_call_max_items(request)
+                )
             else:
+                parser_tools = request.tools
+                if isinstance(request.tool_choice, ToolChoice):
+                    parser_tools = [
+                        tool
+                        for tool in request.tools
+                        if tool.function.name == request.tool_choice.function.name
+                    ]
                 parser_dict[index] = FunctionCallParser(
-                    tools=request.tools,
+                    tools=parser_tools,
                     tool_call_parser=self.tool_call_parser,
                 )
 
@@ -1344,6 +2162,60 @@ class OpenAIServingChat(OpenAIServingBase):
             normal_text, calls = result.normal_text, result.calls
         else:
             normal_text, calls = parser.parse_stream_chunk(delta)
+
+        if (
+            normal_text
+            and (
+                request.tool_choice == "required"
+                or isinstance(request.tool_choice, ToolChoice)
+            )
+        ):
+            normal_text = ""
+
+        # Native Kimi streaming emits argument JSON incrementally. For exact
+        # long-body prompts, wait for the completed tool call so we can repair
+        # the model's 4096-char body cap before any closing JSON is sent.
+        if (
+            calls
+            and not isinstance(parser, JsonArrayParser)
+            and _should_buffer_exact_body_tool_args(request)
+        ):
+            detector = parser.detector if hasattr(parser, "detector") else None
+            buffered_calls = []
+            for call_item in calls:
+                if call_item.name:
+                    buffered_calls.append(call_item)
+
+            completed_tool_id = getattr(detector, "current_tool_id", -1) - 1
+            sent_repaired = getattr(detector, "_exact_body_repaired_stream_ids", set())
+            if (
+                detector is not None
+                and completed_tool_id >= 0
+                and not getattr(detector, "current_tool_name_sent", True)
+                and completed_tool_id not in sent_repaired
+                and completed_tool_id < len(getattr(detector, "prev_tool_call_arr", []))
+            ):
+                current_call = detector.prev_tool_call_arr[completed_tool_id]
+                arguments = current_call.get("arguments")
+                if isinstance(arguments, dict) and isinstance(
+                    arguments.get("body"), str
+                ):
+                    parameters = _repair_exact_text_tool_arguments(
+                        json.dumps(
+                            arguments, ensure_ascii=False, separators=(",", ":")
+                        ),
+                        request,
+                    )
+                    buffered_calls.append(
+                        ToolCallItem(
+                            tool_index=completed_tool_id,
+                            name=None,
+                            parameters=parameters,
+                        )
+                    )
+                    sent_repaired.add(completed_tool_id)
+                    detector._exact_body_repaired_stream_ids = sent_repaired
+            calls = buffered_calls
 
         # Yield normal text
         if normal_text:
@@ -1395,7 +2267,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 index=call_item.tool_index,
                 function=FunctionResponse(
                     name=function_name,
-                    arguments=call_item.parameters,
+                    arguments=_repair_exact_text_tool_arguments(
+                        call_item.parameters, request
+                    ),
                 ),
             )
 

@@ -13,6 +13,7 @@ from torch import nn
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
 from sglang.srt.configs.model_config import ModelConfig, ModelImpl
+from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 
 logger = logging.getLogger(__name__)
@@ -275,6 +276,9 @@ def should_async_load(weight: torch.Tensor) -> bool:
     and improve throughput. For device tensors, threading often adds overhead
     (e.g., GIL contention) without benefit, so we do it synchronously.
     """
+    if envs.SGLANG_DISABLE_ASYNC_WEIGHT_LOAD.get():
+        return False
+
     device = getattr(weight, "device", None)
     if device is None:
         return False

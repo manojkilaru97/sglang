@@ -12,9 +12,12 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolChoice,
     ToolChoiceFuncName,
 )
+from sglang.srt.environ import envs
+from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.function_call.utils import (
     _get_tool_schema_defs,
     get_json_schema_constraint,
+    get_json_schema_max_items,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -77,6 +80,10 @@ class TestJsonSchemaConstraint(unittest.TestCase):
 
         self.assertEqual(schema["type"], "array")
         self.assertEqual(schema["minItems"], 1)
+        self.assertEqual(
+            schema["maxItems"],
+            get_json_schema_max_items(self.tools, "required"),
+        )
         self.assertIn("items", schema)
         self.assertIn("anyOf", schema["items"])
 
@@ -90,6 +97,122 @@ class TestJsonSchemaConstraint(unittest.TestCase):
         self.assertIn("get_weather", tool_names)
         self.assertIn("search", tool_names)
 
+    def test_json_array_parser_completes_at_max_tool_calls(self):
+        """Stop at maxItems even if the model has not emitted the closing array."""
+        parser = JsonArrayParser(max_tool_calls=1)
+
+        parser.parse_streaming_increment('[{"name":"get_weather"', self.tools)
+        parser.parse_streaming_increment(
+            ',"parameters":{"location":"Boston"}}',
+            self.tools,
+        )
+
+        self.assertTrue(parser.is_complete)
+
+    def test_json_array_parser_accepts_single_object_for_named_choice(self):
+        """Some backends emit a single object when maxItems is one."""
+        parser = JsonArrayParser(max_tool_calls=1)
+
+        first = parser.parse_streaming_increment('{"name":"get_weather"', self.tools)
+        second = parser.parse_streaming_increment(
+            ',"parameters":{"location":"Boston"}}',
+            self.tools,
+        )
+
+        self.assertEqual(first.calls, [])
+        self.assertEqual(second.calls[0].name, "get_weather")
+        self.assertEqual(second.calls[0].parameters, '{"location": "Boston"}')
+        self.assertTrue(parser.is_complete)
+
+    def test_required_tool_choice_caps_unbounded_string_arguments(self):
+        """Unbounded strings can keep JSON-schema constrained decoding alive."""
+        schema = get_json_schema_constraint(self.tools, "required")
+        expected_max_length = envs.SGLANG_TOOL_ARG_STRING_MAX_LENGTH.get()
+
+        get_weather_schema = next(
+            item
+            for item in schema["items"]["anyOf"]
+            if item["properties"]["name"]["enum"] == ["get_weather"]
+        )
+        parameters = get_weather_schema["properties"]["parameters"]
+
+        self.assertEqual(
+            parameters["properties"]["location"]["maxLength"],
+            expected_max_length,
+        )
+        self.assertEqual(
+            parameters["properties"]["location"]["pattern"],
+            rf"^[^\n]{{0,{expected_max_length}}}$",
+        )
+        self.assertEqual(
+            parameters["properties"]["unit"]["maxLength"],
+            expected_max_length,
+        )
+        self.assertFalse(parameters["additionalProperties"])
+
+    def test_specific_tool_choice_caps_nested_unbounded_strings(self):
+        """The cap must apply recursively but preserve explicit maxLength."""
+        expected_max_length = envs.SGLANG_TOOL_ARG_STRING_MAX_LENGTH.get()
+        expected_max_items = envs.SGLANG_TOOL_ARRAY_MAX_ITEMS.get()
+        expected_max_properties = envs.SGLANG_TOOL_OBJECT_MAX_PROPERTIES.get()
+        tool = Tool(
+            type="function",
+            function=Function(
+                name="nested_search",
+                description="Search with nested filters",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "maxLength": 256},
+                        "tags": {"type": "array", "items": {"type": "string"}},
+                        "filter": {
+                            "anyOf": [
+                                {"type": "string"},
+                                {
+                                    "type": "object",
+                                    "properties": {"owner": {"type": "string"}},
+                                },
+                            ]
+                        },
+                    },
+                },
+            ),
+        )
+        tool_choice = ToolChoice(
+            type="function", function=ToolChoiceFuncName(name="nested_search")
+        )
+        schema = get_json_schema_constraint([tool], tool_choice)
+        parameters = schema["items"]["properties"]["parameters"]
+
+        self.assertEqual(parameters["maxProperties"], expected_max_properties)
+        self.assertFalse(parameters["additionalProperties"])
+        self.assertEqual(parameters["properties"]["query"]["maxLength"], 256)
+        self.assertEqual(
+            parameters["properties"]["tags"]["items"]["maxLength"],
+            expected_max_length,
+        )
+        self.assertEqual(
+            parameters["properties"]["tags"]["maxItems"],
+            expected_max_items,
+        )
+        self.assertEqual(
+            parameters["properties"]["filter"]["anyOf"][1]["maxProperties"],
+            expected_max_properties,
+        )
+        self.assertFalse(
+            parameters["properties"]["filter"]["anyOf"][1]["additionalProperties"]
+        )
+        self.assertEqual(
+            parameters["properties"]["filter"]["anyOf"][0]["maxLength"],
+            expected_max_length,
+        )
+        self.assertEqual(
+            parameters["properties"]["filter"]["anyOf"][1]["properties"]["owner"][
+                "maxLength"
+            ],
+            expected_max_length,
+        )
+
     def test_specific_tool_choice_schema(self):
         """Test schema generation for specific tool choice"""
         tool_choice = ToolChoice(
@@ -102,7 +225,9 @@ class TestJsonSchemaConstraint(unittest.TestCase):
 
         self.assertEqual(schema["type"], "array")
         self.assertEqual(schema["minItems"], 1)
-        self.assertNotIn("maxItems", schema)
+        self.assertEqual(
+            schema["maxItems"], envs.SGLANG_NAMED_TOOL_MAX_PARALLEL_CALLS.get()
+        )
 
         # Should only have schema for the specific tool
         item_schema = schema["items"]
@@ -121,20 +246,17 @@ class TestJsonSchemaConstraint(unittest.TestCase):
 
         self.assertEqual(schema["type"], "array")
         self.assertEqual(schema["minItems"], 1)
-        self.assertNotIn("maxItems", schema)
+        self.assertEqual(
+            schema["maxItems"], envs.SGLANG_NAMED_TOOL_MAX_PARALLEL_CALLS.get()
+        )
 
         # Should only have schema for the specific tool
         item_schema = schema["items"]
         self.assertEqual(item_schema["properties"]["name"]["enum"], ["search"])
         self.assertIn("parameters", item_schema["properties"])
 
-    def test_specific_tool_choice_allows_multiple_calls(self):
-        """Test that specific tool choice schema allows multiple calls.
-
-        Regression test for https://github.com/sgl-project/sglang/issues/17998:
-        maxItems: 1 caused the model to stall on whitespace when the prompt
-        implied multiple calls to the same function.
-        """
+    def test_specific_tool_choice_allows_one_call_by_default(self):
+        """Forced named tool choice is capped to one deterministic call."""
         tool_choice = ToolChoice(
             type="function", function=ToolChoiceFuncName(name="get_weather")
         )
@@ -143,15 +265,16 @@ class TestJsonSchemaConstraint(unittest.TestCase):
         single_call = [
             {"name": "get_weather", "parameters": {"location": "NYC"}},
         ]
-        multi_call = [
-            {"name": "get_weather", "parameters": {"location": "NYC"}},
-            {"name": "get_weather", "parameters": {"location": "LA"}},
-            {"name": "get_weather", "parameters": {"location": "Chicago"}},
-        ]
 
         validator = jsonschema.Draft202012Validator(schema)
         validator.validate(single_call)
-        validator.validate(multi_call)
+
+        too_many_calls = [
+            {"name": "get_weather", "parameters": {"location": str(i)}}
+            for i in range(envs.SGLANG_NAMED_TOOL_MAX_PARALLEL_CALLS.get() + 1)
+        ]
+        with self.assertRaises(jsonschema.ValidationError):
+            validator.validate(too_many_calls)
 
     def test_specific_tool_choice_no_parallel(self):
         """Test that parallel_tool_calls=False sets maxItems=1"""
@@ -258,6 +381,10 @@ class TestJsonSchemaConstraint(unittest.TestCase):
 
         self.assertIn("$defs", schema)
         self.assertIn("NestedType", schema["$defs"])
+        self.assertEqual(
+            schema["$defs"]["NestedType"]["properties"]["value"]["maxLength"],
+            envs.SGLANG_TOOL_ARG_STRING_MAX_LENGTH.get(),
+        )
 
     def test_tools_without_parameters(self):
         """Test schema generation with tools that have no parameters"""

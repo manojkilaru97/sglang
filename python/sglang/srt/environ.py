@@ -162,6 +162,7 @@ class Envs:
     # Model & File Download
     SGLANG_USE_MODELSCOPE = EnvBool(False)
     SGLANG_SORT_WEIGHT_FILES = EnvBool(False)
+    SGLANG_DISABLE_ASYNC_WEIGHT_LOAD = EnvBool(False)
     SGLANG_DISABLED_MODEL_ARCHS = EnvTuple(tuple())
 
     # Logging Options
@@ -479,6 +480,11 @@ class Envs:
 
     # Tool-Call behavior
     SGLANG_TOOL_STRICT_LEVEL = EnvInt(ToolStrictLevel.OFF)
+    SGLANG_TOOL_ARG_STRING_MAX_LENGTH = EnvInt(4096)
+    SGLANG_TOOL_ARRAY_MAX_ITEMS = EnvInt(64)
+    SGLANG_TOOL_OBJECT_MAX_PROPERTIES = EnvInt(64)
+    SGLANG_TOOL_MAX_PARALLEL_CALLS = EnvInt(6)
+    SGLANG_NAMED_TOOL_MAX_PARALLEL_CALLS = EnvInt(1)
 
     # Ngram
     SGLANG_NGRAM_FORCE_GREEDY_VERIFY = EnvBool(False)
