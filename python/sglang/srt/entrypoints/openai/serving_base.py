@@ -159,6 +159,33 @@ class OpenAIServingBase(ABC):
             raw_payload = None
 
         try:
+            served_model_name = self.tokenizer_manager.served_model_name
+            served_model_names = getattr(
+                self.tokenizer_manager,
+                "served_model_names",
+                [served_model_name],
+            )
+            request_model = getattr(request, "model", None)
+            if request_model:
+                base_model, adapter_name = self._parse_model_parameter(request_model)
+                if base_model not in served_model_names:
+                    response = self.create_error_response(
+                        message=f"Model {request_model!r} is not served.",
+                        err_type="NotFound",
+                        status_code=404,
+                    )
+                    request_logger.log_openai_response(
+                        self._error_log_payload(response),
+                        request=raw_request,
+                        rid=getattr(request, "rid", None),
+                    )
+                    return response
+                if base_model != served_model_name:
+                    canonical_model = served_model_name
+                    if adapter_name is not None:
+                        canonical_model = f"{served_model_name}:{adapter_name}"
+                    request = request.model_copy(update={"model": canonical_model})
+
             # Validate request
             error_msg = self._validate_request(request)
             if error_msg:
