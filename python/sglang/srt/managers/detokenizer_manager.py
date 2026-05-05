@@ -120,6 +120,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
     def init_running_status(self, server_args: ServerArgs):
         self.decode_status = LimitedCapacityDict(capacity=DETOKENIZER_MAX_STATES)
+        self.decode_status_recoveries_total = 0
         self.is_dummy = False
         self.is_tool_call_parser_gpt_oss = server_args.tool_call_parser == "gpt-oss"
         self.disable_tokenizer_batch_decode = server_args.disable_tokenizer_batch_decode
@@ -308,14 +309,29 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 try:
                     s = self.decode_status[rid]
                 except KeyError:
-                    raise RuntimeError(
-                        f"Decode status not found for request {rid}. "
-                        "It may be due to the request being evicted from the decode status due to memory pressure. "
-                        "Please increase the maximum number of requests by setting "
-                        "the SGLANG_DETOKENIZER_MAX_STATES environment variable to a bigger value than the default value. "
-                        f"The current value is {DETOKENIZER_MAX_STATES}. "
-                        "For more details, see: https://github.com/sgl-project/sglang/issues/2812"
+                    self.decode_status_recoveries_total += 1
+                    logger.warning(
+                        "Decode status not found for request %s; recreating "
+                        "detokenizer state instead of terminating the worker. "
+                        "This can happen after cancellation or state eviction. "
+                        "SGLANG_DETOKENIZER_MAX_STATES=%s, "
+                        "decode_status_recoveries_total=%s",
+                        rid,
+                        DETOKENIZER_MAX_STATES,
+                        self.decode_status_recoveries_total,
                     )
+                    # Qwen NVCF restart RCAs from 2026-05-04 showed this path
+                    # killing the full worker after a stale post-cancel output.
+                    # Resume from the scheduler's cumulative text and only emit
+                    # text decoded after this point to avoid duplicating deltas.
+                    s = DecodeStatus(
+                        decoded_text=recv_obj.decoded_texts[i],
+                        decode_ids=recv_obj.decode_ids[i],
+                        surr_offset=0,
+                        read_offset=recv_obj.read_offsets[i],
+                        sent_offset=len(recv_obj.decoded_texts[i]),
+                    )
+                    self.decode_status[rid] = s
             new_text = read_texts[i][len(surr_texts[i]) :]
             if recv_obj.finished_reasons[i] is None:
                 # Streaming chunk: update the decode status
