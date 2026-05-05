@@ -67,6 +67,23 @@ class KvMetrics:
 
 
 class SchedulerMetricsMixin:
+    def _scheduler_log_prefix(self: Scheduler) -> str:
+        dp_rank = getattr(self, "dp_rank", None)
+        attn_dp_rank = getattr(self, "attn_dp_rank", None)
+        attn_tp_rank = getattr(self, "attn_tp_rank", None)
+        pp_rank = getattr(self, "pp_rank", None)
+
+        parts = []
+        if dp_rank is not None:
+            parts.append(f"dp_rank={dp_rank}")
+        elif attn_dp_rank is not None:
+            parts.append(f"attn_dp_rank={attn_dp_rank}")
+        if attn_tp_rank is not None:
+            parts.append(f"attn_tp_rank={attn_tp_rank}")
+        if pp_rank is not None:
+            parts.append(f"pp_rank={pp_rank}")
+        return f" ({', '.join(parts)})" if parts else ""
+
     def init_metrics(
         self: Scheduler, tp_rank: int, pp_rank: int, dp_rank: Optional[int]
     ):
@@ -211,7 +228,7 @@ class SchedulerMetricsMixin:
         iter_msg = f" [{self.forward_ct + 1}]" if LOG_FORWARD_ITERS else ""
 
         msg = (
-            f"Prefill batch{iter_msg}, "
+            f"Prefill batch{self._scheduler_log_prefix()}{iter_msg}, "
             f"#new-seq: {prefill_stats.num_new_seqs}, "
             f"#new-token: {prefill_stats.log_input_tokens}, "
             f"#cached-token: {prefill_stats.log_hit_tokens}, "
@@ -363,7 +380,10 @@ class SchedulerMetricsMixin:
             )
 
         iter_msg = f" [{self.forward_ct}]" if LOG_FORWARD_ITERS else ""
-        msg = f"Decode batch{iter_msg}, #running-req: {num_running_reqs}, {token_usage_msg}"
+        msg = (
+            f"Decode batch{self._scheduler_log_prefix()}{iter_msg}, "
+            f"#running-req: {num_running_reqs}, {token_usage_msg}"
+        )
 
         if self.spec_algorithm.is_none():
             spec_accept_length = 0
