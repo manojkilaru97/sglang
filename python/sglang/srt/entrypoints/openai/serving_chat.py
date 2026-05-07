@@ -473,11 +473,6 @@ class OpenAIServingChat(OpenAIServingBase):
                 ]
             else:
                 tools = [item.model_dump() for item in request.tools]
-            if self.tool_call_parser and request.tool_choice != "auto":
-                parser = FunctionCallParser(request.tools, self.tool_call_parser)
-                tool_call_constraint = parser.get_structure_constraint(
-                    request.tool_choice
-                )
             # Handle JSON schema constraint directly for required or named tool choice
             if request.tool_choice == "required" or isinstance(
                 request.tool_choice, ToolChoice
@@ -1387,13 +1382,10 @@ class OpenAIServingChat(OpenAIServingBase):
         """Process tool calls in streaming response"""
         if index not in parser_dict:
             # Use JSON detector directly for required or named tool choice
-            # unless the configured parser is for a model-native XML/tool tag
-            # format. Qwen3-Coder emits <tool_call>/<function=...> even when
-            # tool_choice=required, so forcing JsonArrayParser leaks raw XML.
             if (
                 request.tool_choice == "required"
                 or isinstance(request.tool_choice, ToolChoice)
-            ) and self.tool_call_parser not in {"qwen3_coder"}:
+            ):
                 parser_dict[index] = JsonArrayParser()
             else:
                 parser_dict[index] = FunctionCallParser(

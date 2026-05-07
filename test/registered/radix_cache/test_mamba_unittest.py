@@ -2,6 +2,7 @@ import unittest
 
 import torch
 
+from sglang.srt.disaggregation.kv_events import BlockRemoved, BlockStored
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
@@ -13,7 +14,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import available_and_evictable_str
-from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
+from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache, TreeNode
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -33,6 +34,32 @@ class TestMamba(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         pass
+
+    def test_mamba_kv_router_events_are_coarse_bounded_blocks(self):
+        cache = object.__new__(MambaRadixCache)
+        cache.root_node = TreeNode()
+        cache.root_node.key = RadixKey([])
+        cache.enable_kv_cache_events = True
+        cache.kv_event_block_size = 64
+        cache.kv_event_queue = []
+
+        node = TreeNode()
+        node.parent = cache.root_node
+        node.key = RadixKey(list(range(255)))
+
+        cache._record_store_event(node)
+        store_events = cache.take_events()
+
+        self.assertEqual(len(store_events), 3)
+        self.assertTrue(all(isinstance(event, BlockStored) for event in store_events))
+        self.assertEqual([event.block_size for event in store_events], [64, 64, 64])
+        self.assertEqual([event.token_ids[0] for event in store_events], [0, 64, 128])
+
+        cache._record_remove_event(node)
+        remove_events = cache.take_events()
+
+        self.assertEqual(len(remove_events), 3)
+        self.assertTrue(all(isinstance(event, BlockRemoved) for event in remove_events))
 
     def test_hybrid_linear_kv_pool(self):
         size = 16

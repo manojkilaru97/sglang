@@ -20,6 +20,7 @@ The radix tree data structure for managing the hybrid (full and Mamba) KV cache.
 """
 
 import heapq
+import os
 from collections import defaultdict
 from functools import partial
 from typing import TYPE_CHECKING, List, Optional, Tuple
@@ -27,6 +28,12 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import torch
 from numpy import float64
 
+from sglang.srt.disaggregation.kv_events import (
+    MEDIUM_GPU,
+    AllBlocksCleared,
+    BlockRemoved,
+    BlockStored,
+)
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.mem_cache.allocator import (
@@ -47,8 +54,11 @@ from sglang.srt.mem_cache.radix_cache import (
     RadixKey,
     _key_match_page_size1,
     _key_match_paged,
+    compute_node_hash_values,
     get_child_key,
+    split_node_hash_value,
 )
+from sglang.srt.mem_cache.hicache_storage import get_hash_str, hash_str_to_int64
 from sglang.srt.server_args import get_global_server_args
 
 if TYPE_CHECKING:
@@ -84,6 +94,7 @@ class TreeNode:
         self.hit_count = 0
         # store the host indices of KV cache
         self.host_value = None
+        self.hash_value = None
 
         # for lru list, invariant:
         # 1. prev has greater last_access_time
@@ -379,6 +390,18 @@ class MambaRadixCache(BasePrefixCache):
         self.page_size = params.page_size
         self.disable = params.disable
         self.enable_mamba_extra_buffer = params.enable_mamba_extra_buffer
+        self.enable_kv_cache_events = params.enable_kv_cache_events and (
+            os.getenv("SGLANG_ENABLE_MAMBA_KV_EVENTS", "0").lower()
+            in ("1", "true", "yes", "on")
+        )
+        self.kv_event_block_size = int(
+            os.getenv("SGLANG_MAMBA_KV_EVENT_BLOCK_SIZE", "64")
+        )
+        if self.kv_event_block_size <= 0:
+            raise ValueError(
+                "SGLANG_MAMBA_KV_EVENT_BLOCK_SIZE must be a positive integer"
+            )
+        self.kv_event_queue = []
 
         if not self.enable_mamba_extra_buffer:
             assert (
@@ -410,6 +433,7 @@ class MambaRadixCache(BasePrefixCache):
         self.root_node = TreeNode()
         self.root_node.key = RadixKey([], None)
         self.root_node.value = []
+        self.root_node.hash_value = []
         self.root_node.full_lock_ref = 1
         self.root_node.mamba_lock_ref = 1
         self.full_evictable_size_ = 0
@@ -785,6 +809,91 @@ class MambaRadixCache(BasePrefixCache):
 
         return full_num_evicted
 
+    def _prefix_tokens_for_node(self, node: TreeNode) -> tuple[list[int], int]:
+        parts = []
+        current = node
+        while current is not None and current != self.root_node:
+            parts.append(current.key.token_ids)
+            current = current.parent
+
+        node_start = sum(len(part) for part in parts[1:])
+        tokens = []
+        for part in reversed(parts):
+            tokens.extend(part)
+        return tokens, node_start
+
+    def _coarse_router_blocks_for_node(
+        self, node: TreeNode
+    ) -> list[tuple[list[int], int, Optional[int]]]:
+        """Return complete coarse prefix blocks intersecting this node.
+
+        MambaRadixCache internally requires page_size=1, but Dynamo routing only
+        needs approximate prefix ownership. Emitting one router event per token
+        makes frontend recovery/tree dumps enormous, so router-visible Mamba
+        events are coalesced to coarse attention-scale blocks.
+        """
+        prefix_tokens, node_start = self._prefix_tokens_for_node(node)
+        block_size = self.kv_event_block_size
+        first_block_start = (node_start // block_size) * block_size
+
+        blocks = []
+        prior_hash = None
+        for block_start in range(0, len(prefix_tokens), block_size):
+            block_end = block_start + block_size
+            if block_end > len(prefix_tokens):
+                break
+
+            block_tokens = prefix_tokens[block_start:block_end]
+            block_hash_hex = get_hash_str(block_tokens, prior_hash=prior_hash)
+            parent_hash = hash_str_to_int64(prior_hash) if prior_hash else None
+            block_hash = hash_str_to_int64(block_hash_hex)
+
+            if block_start >= first_block_start and block_end > node_start:
+                blocks.append((block_tokens, block_hash, parent_hash))
+
+            prior_hash = block_hash_hex
+
+        return blocks
+
+    def _record_store_event(self, node: TreeNode) -> None:
+        # MambaRadixCache owns both full-attention tokens and Mamba state. Dynamo
+        # only needs approximate prefix block visibility; local SGLang matching
+        # remains authoritative for whether the Mamba state is actually reusable.
+        if not self.enable_kv_cache_events:
+            return
+        for block_tokens, block_hash, parent_block_hash in (
+            self._coarse_router_blocks_for_node(node)
+        ):
+            self.kv_event_queue.append(
+                BlockStored(
+                    block_hashes=[block_hash],
+                    parent_block_hash=parent_block_hash,
+                    token_ids=block_tokens,
+                    block_size=len(block_tokens),
+                    lora_id=None,
+                    medium=MEDIUM_GPU,
+                )
+            )
+
+    def _record_remove_event(self, node: TreeNode) -> None:
+        if not self.enable_kv_cache_events:
+            return
+        for _, block_hash, _ in self._coarse_router_blocks_for_node(node):
+            self.kv_event_queue.append(
+                BlockRemoved(block_hashes=[block_hash], medium=MEDIUM_GPU)
+            )
+
+    def _record_all_cleared_event(self) -> None:
+        if self.enable_kv_cache_events:
+            self.kv_event_queue.append(AllBlocksCleared())
+
+    def take_events(self):
+        if not self.enable_kv_cache_events:
+            return []
+        events = self.kv_event_queue
+        self.kv_event_queue = []
+        return events
+
     def inc_lock_ref(self, node: TreeNode) -> Optional[int]:
         """
         Increment the lock reference count for the node.
@@ -1037,6 +1146,9 @@ class MambaRadixCache(BasePrefixCache):
         new_node.mamba_lock_ref = 0
         new_node.key = child.key[:split_len]
         new_node.value = child.value[:split_len].clone()
+        new_node.hash_value, child.hash_value = split_node_hash_value(
+            child.hash_value, split_len, self.page_size
+        )
 
         # child time should be later than parent's time for mamba tombstone
         child.last_access_time = get_last_access_time()
@@ -1108,12 +1220,14 @@ class MambaRadixCache(BasePrefixCache):
             node.children[child_key] = new_node
             self.full_evictable_size_ += len(value)
             self.mamba_evictable_size_ += len(mamba_value)
+            self._record_store_event(new_node)
         elif node.mamba_value is None:  # add for mamba tombstone
             node.mamba_value = mamba_value
             self.full_lru_list.reset_node_mru(node)
             self.mamba_lru_list.insert_mru(node)
             self.mamba_evictable_size_ += len(mamba_value)
             node.last_access_time = get_last_access_time()
+            self._record_store_event(node)
         else:  # mamba value already exists
             mamba_value_exist = True
             self.full_lru_list.reset_node_mru(node)
@@ -1151,6 +1265,7 @@ class MambaRadixCache(BasePrefixCache):
         ), f"Invariant violated: leaf node is a tombstone, {node.id=}"
         assert len(node.children) == 0, f"leaf node has children, {node.id=}"
         key = self.get_child_key_fn(node.key)
+        self._record_remove_event(node)
         v = node.parent.children.pop(key, None)
         assert v == node, f"parent does not have child key, {key}"
 
@@ -1168,6 +1283,7 @@ class MambaRadixCache(BasePrefixCache):
         ), f"Deleting a unexpected non-tombstone leaf node, {node.id=}"
         assert len(node.children) == 0, f"leaf node has children, {node.id=}"
         key = self.get_child_key_fn(node.key)
+        self._record_remove_event(node)
         v = node.parent.children.pop(key, None)
         assert v == node, f"parent does not have child key, {key}"
 
