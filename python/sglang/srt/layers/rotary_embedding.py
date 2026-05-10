@@ -36,6 +36,7 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 _is_musa = is_musa()
+_force_native_mrope = get_bool_env_var("SGLANG_FORCE_NATIVE_MROPE")
 
 if _is_cuda:
     from sglang.jit_kernel.rope import (
@@ -1746,7 +1747,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         assert positions.ndim == 1 or positions.ndim == 2
 
         # Use Triton kernel for multimodal (2D positions) with mrope
-        if positions.ndim == 2 and self.mrope_section:
+        if positions.ndim == 2 and self.mrope_section and not _force_native_mrope:
             return self.forward_triton(positions, query, key)
         return self.forward_native(positions, query, key, fused_set_kv_buffer_arg)
 

@@ -74,6 +74,7 @@ _is_xpu = is_xpu()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_force_torch_native_topk = get_bool_env_var("SGLANG_FORCE_TORCH_NATIVE_TOPK")
 
 if _is_cuda:
     from sgl_kernel import moe_fused_gate
@@ -460,6 +461,28 @@ def fused_topk(
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
     M, _ = hidden_states.shape
+    num_experts = gating_output.shape[-1]
+
+    # The current sgl_kernel.topk_softmax wrapper cannot pass the workspace that
+    # the kernel requires for non-power-of-two expert counts. Fall back to the
+    # existing torch-native route selection instead of crashing the scheduler.
+    if _force_torch_native_topk or (
+        scoring_func == "softmax" and num_experts & (num_experts - 1)
+    ):
+        topk_weights, topk_ids = fused_topk_torch_native(
+            hidden_states=hidden_states,
+            gating_output=gating_output,
+            topk=topk,
+            renormalize=renormalize,
+            correction_bias=correction_bias,
+            scoring_func=scoring_func,
+        )
+        topk_ids = topk_ids.to(torch.int32)
+        topk_ids = topk_ids_logical_to_physical(
+            topk_ids, expert_location_dispatch_info
+        )
+        _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+        return topk_weights, topk_ids
 
     topk_weights = torch.empty(
         M, topk, dtype=torch.float32, device=hidden_states.device

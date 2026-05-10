@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -17,13 +18,24 @@ if TYPE_CHECKING:
 _is_npu = is_npu()
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
-def _resolve_future_token_ids(input_ids, future_token_ids_map):
+def _resolve_future_token_ids_eager(input_ids, future_token_ids_map):
     input_ids[:] = torch.where(
         input_ids < 0,
         future_token_ids_map[torch.clamp(-input_ids, min=0)],
         input_ids,
     )
+
+
+if os.getenv("SGLANG_DISABLE_COMPILED_FUTURE_RESOLVE", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+):
+    _resolve_future_token_ids = _resolve_future_token_ids_eager
+else:
+    _resolve_future_token_ids = torch.compile(
+        dynamic=True, backend=get_compiler_backend(), disable=_is_npu
+    )(_resolve_future_token_ids_eager)
 
 
 @dataclass

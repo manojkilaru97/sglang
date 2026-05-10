@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from enum import IntEnum
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -106,6 +107,12 @@ except ImportError:
 
 # Initialize logger for the module
 logger = logging.getLogger(__name__)
+
+
+def _shape_dtype(tensor: Optional[torch.Tensor]) -> str:
+    if tensor is None:
+        return "None"
+    return f"shape={tuple(tensor.shape)} dtype={tensor.dtype}"
 
 
 def _sglang_fp4_gemm_fake(
@@ -1356,6 +1363,44 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         """Access the global enable_flashinfer_cutedsl_moe setting."""
         return get_moe_runner_backend().is_flashinfer_cutedsl()
 
+    def _slice_global_expert_scale_to_local(
+        self,
+        layer: torch.nn.Module,
+        scale: torch.Tensor,
+        target: torch.Tensor,
+        name: str,
+    ) -> torch.Tensor:
+        if scale.ndim == 0 or target.ndim == 0 or scale.shape[0] == target.shape[0]:
+            return scale
+
+        num_experts = getattr(layer, "num_experts", None)
+        num_local_experts = getattr(layer, "num_local_experts", None)
+        moe_ep_rank = getattr(layer, "moe_ep_rank", None)
+        if (
+            num_experts is not None
+            and num_local_experts is not None
+            and moe_ep_rank is not None
+            and scale.shape[0] == num_experts
+            and target.shape[0] == num_local_experts
+        ):
+            start = moe_ep_rank * num_local_experts
+            end = start + num_local_experts
+            logger.info_once(
+                "Slicing global %s from %s to local EP shard [%s:%s] to match %s",
+                name,
+                tuple(scale.shape),
+                start,
+                end,
+                tuple(target.shape),
+            )
+            return scale[start:end]
+
+        raise RuntimeError(
+            f"Cannot align {name} shape {tuple(scale.shape)} with target "
+            f"shape {tuple(target.shape)} for layer with num_experts={num_experts}, "
+            f"num_local_experts={num_local_experts}, moe_ep_rank={moe_ep_rank}"
+        )
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -1548,6 +1593,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             w13_input_scale = layer.w13_input_scale.max(dim=-1).values.to(torch.float32)
             w2_input_scale = layer.w2_input_scale
 
+        w13_input_scale = self._slice_global_expert_scale_to_local(
+            layer, w13_input_scale, w13_weight_scale_2, "w13_input_scale"
+        )
+        w2_input_scale = self._slice_global_expert_scale_to_local(
+            layer, w2_input_scale, layer.w2_weight_scale_2, "w2_input_scale"
+        )
+
         # Create shared parameters
         layer.g1_alphas = Parameter(
             (w13_input_scale * w13_weight_scale_2).to(torch.float32),
@@ -1667,10 +1719,15 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
             # Set up CUTLASS MoE parameters
             device = layer.w13_weight.device
+            cutlass_num_experts = (
+                layer.num_experts
+                if self.enable_flashinfer_cutlass_moe
+                else layer.num_local_experts
+            )
             layer.cutlass_moe_params = CutlassMoEParams(
                 CutlassMoEType.BlockscaledFP4,
                 device,
-                num_experts=layer.num_experts,  # global num experts
+                num_experts=cutlass_num_experts,
                 intermediate_size_per_partition=layer.w2_weight.shape[2] * 2,  # n
                 hidden_size=layer.w13_weight.shape[2] * 2,
             )  # k
@@ -1767,6 +1824,50 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                         device=x.device,
                     )
 
+            if (
+                os.getenv("SGLANG_FLASHINFER_CUTLASS_DEBUG", "").lower()
+                in ("1", "true", "yes")
+                and not getattr(layer, "_flashinfer_cutlass_debug_logged", False)
+            ):
+                setattr(layer, "_flashinfer_cutlass_debug_logged", True)
+                try:
+                    topk_min = int(topk_ids.detach().amin().item())
+                    topk_max = int(topk_ids.detach().amax().item())
+                except Exception as exc:
+                    topk_min = f"error:{exc}"
+                    topk_max = f"error:{exc}"
+                logger.warning(
+                    "FlashInfer Cutlass MoE debug: layer=%s ep=%s/%s tp=%s/%s "
+                    "experts global=%s local=%s input=%s input_sf=%s output=%s "
+                    "topk=%s topk_min=%s topk_max=%s weights=%s/%s scales=%s",
+                    getattr(layer, "layer_id", None),
+                    layer.moe_ep_rank,
+                    layer.moe_ep_size,
+                    layer.moe_tp_rank,
+                    layer.moe_tp_size,
+                    layer.num_experts,
+                    layer.num_local_experts,
+                    _shape_dtype(x),
+                    _shape_dtype(x_sf),
+                    _shape_dtype(symm_output),
+                    _shape_dtype(topk_ids),
+                    topk_min,
+                    topk_max,
+                    _shape_dtype(layer.w13_weight),
+                    _shape_dtype(layer.w2_weight),
+                    [
+                        _shape_dtype(scale)
+                        for scale in (
+                            layer.w13_input_scale_quant,
+                            layer.w13_blockscale_swizzled,
+                            layer.g1_alphas,
+                            layer.w2_input_scale_quant,
+                            layer.w2_blockscale_swizzled,
+                            layer.g2_alphas,
+                        )
+                    ],
+                )
+
             output = flashinfer_cutlass_fused_moe(
                 output=symm_output,
                 input=x,
@@ -1792,6 +1893,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 tune_max_num_tokens=next_power_of_2(x.shape[0]),
                 activation_type=ACT_STR_TO_TYPE_MAP[activation],
                 enable_alltoall=get_moe_a2a_backend().is_flashinfer(),
+                enable_pdl=not get_bool_env_var(
+                    "SGLANG_FLASHINFER_CUTLASS_DISABLE_PDL", "false"
+                ),
             )[0]
 
             from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
