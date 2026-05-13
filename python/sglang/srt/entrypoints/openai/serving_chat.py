@@ -1,13 +1,10 @@
 from __future__ import annotations
 
-import base64
 import copy
 import json
 import logging
-import re
 import time
 import uuid
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
 
 import jinja2
@@ -85,131 +82,6 @@ def _extract_max_dynamic_patch(request: ChatCompletionRequest):
     img_max_dynamic_patch = min(img_vals) if img_vals else None
     vid_max_dynamic_patch = min(vid_vals) if vid_vals else None
     return img_max_dynamic_patch, vid_max_dynamic_patch
-
-
-def _resolve_nvcf_asset_refs_in_messages(
-    messages: list[dict[str, Any]], raw_request: Optional[Request]
-) -> list[dict[str, Any]]:
-    if raw_request is None:
-        return messages
-
-    headers = raw_request.headers
-    asset_dir = headers.get("NVCF-INPUT-ASSET-DIR") or headers.get("NVCF-ASSET-DIR")
-    allowed_ids_hdr = headers.get("NVCF-INPUT-ASSET-REFERENCES") or headers.get(
-        "NVCF-FUNCTION-ASSET-IDS"
-    )
-    if not asset_dir or not allowed_ids_hdr:
-        return messages
-
-    asset_root = Path(asset_dir).resolve()
-    if not asset_root.exists() or not asset_root.is_dir():
-        raise ValueError(f"Invalid NVCF asset directory: {asset_dir}")
-
-    def normalize_asset_id(value: str) -> str:
-        out = (value or "").strip().strip(",").strip()
-        while len(out) >= 2 and out[0] in ("'", '"') and out[-1] == out[0]:
-            out = out[1:-1].strip()
-        return out
-
-    allowed_ids = {
-        normalize_asset_id(item) for item in allowed_ids_hdr.split(",") if item.strip()
-    }
-
-    def to_base64_data_url(data_url: str) -> str:
-        match = re.match(
-            r"^data:(?P<mime>(?:image|video|audio)/[^;]+);asset_id,(?P<asset_id>.+)$",
-            data_url,
-        )
-        if match is None:
-            return data_url
-        mime = match.group("mime")
-        asset_id = normalize_asset_id(match.group("asset_id"))
-        if asset_id not in allowed_ids:
-            raise ValueError(
-                f"Asset id '{asset_id}' not permitted by NVCF asset references"
-            )
-        file_path = (asset_root / asset_id).resolve()
-        if file_path != asset_root and asset_root not in file_path.parents:
-            raise ValueError("Asset path escapes NVCF asset directory")
-        raw = file_path.read_bytes()
-        encoded = base64.b64encode(raw).decode("ascii")
-        return f"data:{mime};base64,{encoded}"
-
-    def transform_message(message: dict[str, Any]) -> dict[str, Any]:
-        msg = dict(message)
-        content = msg.get("content")
-        if isinstance(content, list):
-            new_parts = []
-            for part in content:
-                if not isinstance(part, dict):
-                    new_parts.append(part)
-                    continue
-                new_part = dict(part)
-                for field_name in ("image_url", "video_url", "audio_url"):
-                    url_obj = new_part.get(field_name)
-                    if isinstance(url_obj, dict):
-                        url = url_obj.get("url")
-                        if isinstance(url, str) and ";asset_id," in url:
-                            url_obj = dict(url_obj)
-                            url_obj["url"] = to_base64_data_url(url)
-                            new_part[field_name] = url_obj
-                    elif isinstance(url_obj, str) and ";asset_id," in url_obj:
-                        new_part[field_name] = {"url": to_base64_data_url(url_obj)}
-                new_parts.append(new_part)
-            msg["content"] = new_parts
-            return msg
-
-        if isinstance(content, str):
-            tag_re = re.compile(
-                r"<(?P<tag>img|video|audio)\s+[^>]*src=(?P<quote>['\"])(?P<src>.*?)(?P=quote)[^>]*\/?>",
-                re.IGNORECASE,
-            )
-            parts: list[dict[str, Any]] = []
-            offset = 0
-            for match in tag_re.finditer(content):
-                start, end = match.span()
-                if start > offset:
-                    text = content[offset:start]
-                    if text:
-                        parts.append({"type": "text", "text": text})
-                tag = (match.group("tag") or "").lower()
-                src = match.group("src")
-                if isinstance(src, str) and ";asset_id," in src:
-                    if tag == "img" and src.startswith("data:image/"):
-                        parts.append(
-                            {
-                                "type": "image_url",
-                                "image_url": {"url": to_base64_data_url(src)},
-                            }
-                        )
-                    elif tag == "video" and src.startswith("data:video/"):
-                        parts.append(
-                            {
-                                "type": "video_url",
-                                "video_url": {"url": to_base64_data_url(src)},
-                            }
-                        )
-                    elif tag == "audio" and src.startswith("data:audio/"):
-                        parts.append(
-                            {
-                                "type": "audio_url",
-                                "audio_url": {"url": to_base64_data_url(src)},
-                            }
-                        )
-                    else:
-                        parts.append({"type": "text", "text": match.group(0)})
-                else:
-                    parts.append({"type": "text", "text": match.group(0)})
-                offset = end
-            if parts:
-                if offset < len(content):
-                    tail = content[offset:]
-                    if tail:
-                        parts.append({"type": "text", "text": tail})
-                msg["content"] = parts
-        return msg
-
-    return [transform_message(message) for message in messages]
 
 
 class OpenAIServingChat(OpenAIServingBase):
@@ -370,16 +242,6 @@ class OpenAIServingChat(OpenAIServingBase):
         request: ChatCompletionRequest,
         raw_request: Request = None,
     ) -> tuple[GenerateReqInput, ChatCompletionRequest]:
-        if raw_request is not None:
-            request_data = request.model_dump()
-            messages = request_data.get("messages") or []
-            resolved_messages = _resolve_nvcf_asset_refs_in_messages(
-                messages, raw_request
-            )
-            if resolved_messages != messages:
-                request_data["messages"] = resolved_messages
-                request = ChatCompletionRequest.model_validate(request_data)
-
         reasoning_effort = (
             request.chat_template_kwargs.pop("reasoning_effort", None)
             if request.chat_template_kwargs
