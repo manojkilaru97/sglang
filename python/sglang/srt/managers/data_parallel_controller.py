@@ -561,6 +561,11 @@ class DataParallelController:
 
     def event_loop(self):
         while True:
+            for proc in self.scheduler_procs:
+                if proc.exitcode is not None:
+                    raise RuntimeError(
+                        f"Scheduler process {proc.pid} terminated with {proc.exitcode}"
+                    )
             while True:
                 self.soft_watchdog.feed()
                 try:
